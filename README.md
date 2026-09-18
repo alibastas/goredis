@@ -26,6 +26,17 @@ Flags: `-addr` sets the listen address, `-debug` enables per-connection logs.
 No `redis-cli` at hand? The server also understands inline commands, so
 `telnet 127.0.0.1 6380` followed by `PING` works too.
 
+## Supported commands
+
+| Group      | Commands |
+|------------|----------|
+| Connection | `PING`, `ECHO` |
+| Strings    | `GET`, `SET [NX\|XX] [EX s\|PX ms\|KEEPTTL]`, `INCR`, `DECR`, `INCRBY`, `DECRBY` |
+| Keyspace   | `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `KEYS`, `DBSIZE`, `FLUSHDB` |
+
+Replies and error messages match Redis, so existing clients behave the
+same way against goredis.
+
 ## Development
 
 ```bash
@@ -37,8 +48,7 @@ go test ./internal/resp -run='^$' -fuzz=FuzzReadValue -fuzztime=30s  # fuzz the 
 
 - [x] **Phase 0:** Project scaffolding
 - [x] **Phase 1:** TCP server and RESP2 protocol (`PING`, `ECHO`, pipelining)
-- [ ] **Phase 2a:** Concurrency-safe storage engine, string commands
-      (`GET`, `SET` with `EX/PX/NX/XX`, `DEL`, `EXISTS`, `INCR`, `EXPIRE`, `TTL`, `PERSIST`, `KEYS`)
+- [x] **Phase 2a:** Concurrency-safe storage engine, string and keyspace commands
 - [ ] **Phase 2b:** Hash, list and set data types
 - [ ] **Phase 2c:** Lazy and active key expiry, sharded keyspace, benchmarks
 - [ ] **Phase 3:** Persistence: append-only file (AOF) and snapshots
@@ -78,6 +88,38 @@ is one goroutine per client connection with a keyspace protected by locks.
 The keyspace starts behind a single `sync.RWMutex`. It will later be split
 into shards so that unrelated keys don't contend on the same lock. That change
 will only be made once a benchmark shows the difference.
+
+### Lazy expiry that never blocks readers
+
+Each key stores an optional deadline. Once the deadline has passed, every
+command treats the key as missing. Reads (`GET`, `EXISTS`, `TTL`) only take
+the read side of the `RWMutex`, so they skip expired keys without deleting
+them. That way concurrent readers never wait for each other. Writes
+already hold the exclusive lock, so they delete any expired key they come
+across. Keys that nobody touches again are left for the background
+expiry cycle added in Phase 2c.
+
+### Atomic read-modify-write
+
+`INCR` reads the value, adds to it and writes it back while holding the
+write lock the whole time. Two clients incrementing the same key can't
+interleave and lose an update. A test fires 4,000 concurrent `INCR`s over
+TCP and checks the total.
+
+### Time is injected
+
+The store reads the time through a `func() time.Time` it receives at
+construction. Production code passes `time.Now`, tests pass a fake clock
+they move forward by hand. Expiry tests therefore run instantly and never
+flake, with no `time.Sleep` anywhere.
+
+### A linear-time glob matcher
+
+`KEYS` (and later `PSUBSCRIBE`) patterns use a small hand-written matcher
+instead of `path.Match`, whose `*` stops at `/`. A naive recursive matcher
+takes exponential time on patterns like `*a*a*a*a*b`, so this one
+remembers the last `*` and retries from there, which keeps it at
+O(pattern × input). A test checks this with a pathological pattern.
 
 ### Replies are flushed only when the input buffer is empty
 
