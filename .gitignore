@@ -1,0 +1,33 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/goredis
+
+# Test and profiling output
+*.test
+*.out
+coverage.*
+*.prof
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Data files produced by the server
+*.aof
+*.snap
+/data/
+
+# Environment
+.env
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
