@@ -16,15 +16,30 @@ It uses only the Go standard library.
 
 Requires Go 1.23 or newer.
 
+Start the server:
+
 ```bash
 go run ./cmd/goredis          # listens on 127.0.0.1:6380
-redis-cli -p 6380 PING        # PONG
 ```
 
-Flags: `-addr` sets the listen address, `-debug` enables per-connection logs.
+Talk to it with the bundled client, which works on any OS without
+installing Redis:
 
-No `redis-cli` at hand? The server also understands inline commands, so
-`telnet 127.0.0.1 6380` followed by `PING` works too.
+```
+$ go run ./cmd/goredis-cli
+127.0.0.1:6380> SET greeting "hello world" EX 60
+OK
+127.0.0.1:6380> GET greeting
+"hello world"
+127.0.0.1:6380> TTL greeting
+(integer) 60
+```
+
+`goredis-cli GET greeting` runs a single command and exits. The official
+`redis-cli -p 6380` works as well.
+
+Server flags: `-addr` sets the listen address, `-debug` enables
+per-connection logs. Client flags: `-h` host, `-p` port.
 
 ## Supported commands
 
@@ -59,7 +74,8 @@ go test ./internal/resp -run='^$' -fuzz=FuzzReadValue -fuzztime=30s  # fuzz the 
 ## Architecture
 
 ```
-cmd/goredis/          entry point: flags, config, startup
+cmd/goredis/          server entry point: flags, config, startup
+cmd/goredis-cli/      interactive command-line client
 internal/resp/        RESP2 parser and writer (pure protocol, no I/O policy)
 internal/server/      TCP listener, one goroutine per connection, client state
 internal/command/     command table and argument validation
