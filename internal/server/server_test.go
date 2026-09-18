@@ -173,6 +173,43 @@ func TestConcurrentClients(t *testing.T) {
 	wg.Wait()
 }
 
+// Many clients increment the same key at once over real connections. If any
+// increment were lost, the final count would come up short.
+func TestConcurrentIncrementsOverTCP(t *testing.T) {
+	addr, _ := startServer(t)
+
+	const clients, increments = 20, 200
+	var wg sync.WaitGroup
+	for range clients {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer conn.Close()
+			r := resp.NewReader(conn)
+			for range increments {
+				if _, err := io.WriteString(conn, "INCR hits\r\n"); err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := r.ReadValue(); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	c := dial(t, addr)
+	c.send("GET hits\r\n")
+	c.expect(resp.NewBulkString("4000"))
+}
+
 func TestShutdownClosesOpenConnections(t *testing.T) {
 	addr, shutdown := startServer(t)
 	c := dial(t, addr)
