@@ -13,6 +13,7 @@ import (
 
 	"github.com/alibastas/goredis/internal/command"
 	"github.com/alibastas/goredis/internal/server"
+	"github.com/alibastas/goredis/internal/store"
 )
 
 func main() {
@@ -45,7 +46,7 @@ func run() error {
 	}
 	logger.Info("goredis is ready to accept connections", "addr", ln.Addr().String())
 
-	srv := server.New(command.NewRegistry(), logger)
+	srv := server.New(command.NewRegistry(store.New()), logger)
 	if err := srv.Serve(ctx, ln); err != nil {
 		return err
 	}

@@ -4,8 +4,10 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alibastas/goredis/internal/resp"
+	"github.com/alibastas/goredis/internal/store"
 )
 
 // cmd builds a request the way a client sends it: an array of bulk strings.
@@ -16,6 +18,41 @@ func cmd(args ...string) resp.Value {
 	}
 	return resp.NewArray(elems...)
 }
+
+// harness runs commands against a fresh registry whose clock only moves
+// when the test calls advance.
+type harness struct {
+	t   *testing.T
+	r   *Registry
+	now time.Time
+}
+
+func newHarness(t *testing.T) *harness {
+	h := &harness{t: t, now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	h.r = NewRegistry(store.NewWithClock(func() time.Time { return h.now }))
+	return h
+}
+
+func (h *harness) advance(d time.Duration) { h.now = h.now.Add(d) }
+
+// expect runs the command given by args and fails the test if the reply is
+// not want.
+func (h *harness) expect(want resp.Value, args ...string) {
+	h.t.Helper()
+	if got := h.r.Dispatch(cmd(args...)); !reflect.DeepEqual(got, want) {
+		h.t.Fatalf("%s\n got: %+v\nwant: %+v", strings.Join(args, " "), got, want)
+	}
+}
+
+// Shorthands for the replies that show up in almost every test.
+var (
+	null = resp.NullBulkString()
+	OK   = resp.NewSimpleString("OK")
+)
+
+func bulk(s string) resp.Value       { return resp.NewBulkString(s) }
+func integer(n int64) resp.Value     { return resp.NewInteger(n) }
+func errReply(msg string) resp.Value { return resp.NewError(msg) }
 
 func TestDispatch(t *testing.T) {
 	long := strings.Repeat("x", 200)
@@ -67,7 +104,7 @@ func TestDispatch(t *testing.T) {
 		},
 	}
 
-	r := NewRegistry()
+	r := NewRegistry(store.New())
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := r.Dispatch(tt.req); !reflect.DeepEqual(got, tt.want) {

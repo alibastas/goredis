@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/alibastas/goredis/internal/resp"
+	"github.com/alibastas/goredis/internal/store"
 )
 
 // Handler runs one command. args holds the arguments after the command
@@ -36,11 +37,42 @@ type Registry struct {
 	commands map[string]command
 }
 
-func NewRegistry() *Registry {
+// NewRegistry creates a registry whose data commands operate on db.
+func NewRegistry(db *store.Store) *Registry {
 	r := &Registry{commands: make(map[string]command)}
+	h := &handlers{db: db}
+
+	// Connection
 	r.register("PING", -1, ping)
 	r.register("ECHO", 2, echo)
+
+	// Strings
+	r.register("GET", 2, h.get)
+	r.register("SET", -3, h.set)
+	r.register("INCR", 2, h.incr)
+	r.register("DECR", 2, h.decr)
+	r.register("INCRBY", 3, h.incrBy)
+	r.register("DECRBY", 3, h.decrBy)
+
+	// Keyspace
+	r.register("DEL", -2, h.del)
+	r.register("EXISTS", -2, h.exists)
+	r.register("EXPIRE", 3, h.expire)
+	r.register("PEXPIRE", 3, h.pexpire)
+	r.register("TTL", 2, h.ttl)
+	r.register("PTTL", 2, h.pttl)
+	r.register("PERSIST", 2, h.persist)
+	r.register("KEYS", 2, h.keys)
+	r.register("DBSIZE", 1, h.dbsize)
+	r.register("FLUSHDB", 1, h.flushdb)
 	return r
+}
+
+// handlers groups the commands that need access to the store. Its methods
+// are registered as Handlers: a method value like h.get is an ordinary
+// func(args []string) resp.Value with h already bound to it.
+type handlers struct {
+	db *store.Store
 }
 
 func (r *Registry) register(name string, arity int, h Handler) {
@@ -95,6 +127,17 @@ func unknownCommand(args []string) resp.Value {
 		fmt.Fprintf(&b, "'%s' ", truncate(arg))
 	}
 	return resp.NewError(b.String())
+}
+
+// Replies shared by many commands.
+var (
+	okReply      = resp.NewSimpleString("OK")
+	syntaxError  = resp.NewError("ERR syntax error")
+	notAnInteger = resp.NewError("ERR " + store.ErrNotInteger.Error())
+)
+
+func invalidExpireTime(cmd string) resp.Value {
+	return resp.NewError(fmt.Sprintf("ERR invalid expire time in '%s' command", cmd))
 }
 
 func wrongArgCount(name string) resp.Value {

@@ -13,6 +13,7 @@ import (
 
 	"github.com/alibastas/goredis/internal/command"
 	"github.com/alibastas/goredis/internal/resp"
+	"github.com/alibastas/goredis/internal/store"
 )
 
 // startServer runs a server on a random free port and returns its address.
@@ -28,7 +29,7 @@ func startServer(t *testing.T) (addr string, shutdown func()) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(command.NewRegistry(), logger)
+	srv := New(command.NewRegistry(store.New()), logger)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)
