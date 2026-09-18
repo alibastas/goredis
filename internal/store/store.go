@@ -22,7 +22,7 @@ var (
 const NoExpiry time.Duration = -1
 
 type entry struct {
-	value string
+	value value
 	// expiresAt is the moment the key stops existing. The zero Time means
 	// the key never expires.
 	expiresAt time.Time
@@ -76,11 +76,35 @@ func (s *Store) lookupForWrite(key string, now time.Time) (entry, bool) {
 	return e, ok
 }
 
-func (s *Store) Get(key string) (string, bool) {
+// removeIfEmpty deletes key once a collection stored under it has no
+// elements left. Redis never keeps empty hashes, lists or sets around:
+// removing the last element removes the key. The caller must hold the
+// write lock.
+func (s *Store) removeIfEmpty(key string, size int) {
+	if size == 0 {
+		delete(s.data, key)
+	}
+}
+
+// Get returns the string stored at key. It fails with ErrWrongType if the
+// key holds a hash, list or set.
+func (s *Store) Get(key string) (string, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, found, err := as[stringValue](s.lookup(key, s.now()))
+	return string(v), found, err
+}
+
+// Type returns the name of the type stored at key ("string", "hash",
+// "list" or "set"), or "none" if the key does not exist.
+func (s *Store) Type(key string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	e, ok := s.lookup(key, s.now())
-	return e.value, ok
+	if !ok {
+		return "none"
+	}
+	return e.value.typeName()
 }
 
 // SetCondition restricts when Set is allowed to write.
@@ -100,9 +124,10 @@ type SetOptions struct {
 	KeepTTL bool
 }
 
-// Set stores value under key. It returns false if the write was skipped
-// because opts.Condition did not hold.
-func (s *Store) Set(key, value string, opts SetOptions) bool {
+// Set stores the string val under key. Like in Redis, it replaces whatever
+// the key held before, whatever its type. It returns false if the write was
+// skipped because opts.Condition did not hold.
+func (s *Store) Set(key, val string, opts SetOptions) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -112,7 +137,7 @@ func (s *Store) Set(key, value string, opts SetOptions) bool {
 		return false
 	}
 
-	e := entry{value: value}
+	e := entry{value: stringValue(val)}
 	switch {
 	case opts.TTL > 0:
 		e.expiresAt = now.Add(opts.TTL)
@@ -165,9 +190,14 @@ func (s *Store) IncrBy(key string, delta int64) (int64, error) {
 	defer s.mu.Unlock()
 
 	e, exists := s.lookupForWrite(key, s.now())
+	str, _, err := as[stringValue](e, exists)
+	if err != nil {
+		return 0, err
+	}
+
 	var current int64
 	if exists {
-		n, err := strconv.ParseInt(e.value, 10, 64)
+		n, err := strconv.ParseInt(string(str), 10, 64)
 		if err != nil {
 			return 0, ErrNotInteger
 		}
@@ -178,7 +208,7 @@ func (s *Store) IncrBy(key string, delta int64) (int64, error) {
 		return 0, ErrOverflow
 	}
 	current += delta
-	e.value = strconv.FormatInt(current, 10)
+	e.value = stringValue(strconv.FormatInt(current, 10))
 	s.data[key] = e
 	return current, nil
 }

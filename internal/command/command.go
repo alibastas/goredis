@@ -65,6 +65,31 @@ func NewRegistry(db *store.Store) *Registry {
 	r.register("KEYS", 2, h.keys)
 	r.register("DBSIZE", 1, h.dbsize)
 	r.register("FLUSHDB", 1, h.flushdb)
+	r.register("TYPE", 2, h.typeOf)
+
+	// Hashes
+	r.register("HSET", -4, h.hset)
+	r.register("HGET", 3, h.hget)
+	r.register("HDEL", -3, h.hdel)
+	r.register("HGETALL", 2, h.hgetall)
+	r.register("HEXISTS", 3, h.hexists)
+	r.register("HLEN", 2, h.hlen)
+
+	// Lists
+	r.register("LPUSH", -3, h.lpush)
+	r.register("RPUSH", -3, h.rpush)
+	r.register("LPOP", -2, h.lpop)
+	r.register("RPOP", -2, h.rpop)
+	r.register("LRANGE", 4, h.lrange)
+	r.register("LINDEX", 3, h.lindex)
+	r.register("LLEN", 2, h.llen)
+
+	// Sets
+	r.register("SADD", -3, h.sadd)
+	r.register("SREM", -3, h.srem)
+	r.register("SMEMBERS", 2, h.smembers)
+	r.register("SISMEMBER", 3, h.sismember)
+	r.register("SCARD", 2, h.scard)
 	return r
 }
 
@@ -135,6 +160,33 @@ var (
 	syntaxError  = resp.NewError("ERR syntax error")
 	notAnInteger = resp.NewError("ERR " + store.ErrNotInteger.Error())
 )
+
+// errorReply turns an error from the store into a RESP error. Redis
+// prefixes generic errors with "ERR"; WRONGTYPE errors carry their own
+// prefix, which clients check for.
+func errorReply(err error) resp.Value {
+	if errors.Is(err, store.ErrWrongType) {
+		return resp.NewError(err.Error())
+	}
+	return resp.NewError("ERR " + err.Error())
+}
+
+// stringsReply turns a slice of strings into an array of bulk strings.
+func stringsReply(items []string) resp.Value {
+	elems := make([]resp.Value, len(items))
+	for i, s := range items {
+		elems[i] = resp.NewBulkString(s)
+	}
+	return resp.Value{Type: resp.Array, Array: elems}
+}
+
+// intReply wraps the (count, error) results most store methods return.
+func intReply(n int, err error) resp.Value {
+	if err != nil {
+		return errorReply(err)
+	}
+	return resp.NewInteger(int64(n))
+}
 
 func invalidExpireTime(cmd string) resp.Value {
 	return resp.NewError(fmt.Sprintf("ERR invalid expire time in '%s' command", cmd))

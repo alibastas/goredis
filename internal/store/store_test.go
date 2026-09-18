@@ -23,15 +23,15 @@ func newTestStore() (*Store, *fakeClock) {
 
 func mustGet(t *testing.T, s *Store, key, want string) {
 	t.Helper()
-	got, ok := s.Get(key)
-	if !ok || got != want {
-		t.Fatalf("Get(%q) = %q, %v; want %q, true", key, got, ok, want)
+	got, ok, err := s.Get(key)
+	if err != nil || !ok || got != want {
+		t.Fatalf("Get(%q) = %q, %v, %v; want %q, true, nil", key, got, ok, err, want)
 	}
 }
 
 func mustBeMissing(t *testing.T, s *Store, key string) {
 	t.Helper()
-	if got, ok := s.Get(key); ok {
+	if got, ok, _ := s.Get(key); ok {
 		t.Fatalf("Get(%q) = %q, want missing key", key, got)
 	}
 }

@@ -11,7 +11,10 @@ import (
 )
 
 func (h *handlers) get(args []string) resp.Value {
-	value, found := h.db.Get(args[0])
+	value, found, err := h.db.Get(args[0])
+	if err != nil {
+		return errorReply(err)
+	}
 	if !found {
 		return resp.NullBulkString()
 	}
@@ -94,7 +97,7 @@ func (h *handlers) decrBy(args []string) resp.Value {
 func (h *handlers) addToInteger(key string, delta int64) resp.Value {
 	n, err := h.db.IncrBy(key, delta)
 	if err != nil {
-		return resp.NewError("ERR " + err.Error())
+		return errorReply(err)
 	}
 	return resp.NewInteger(n)
 }

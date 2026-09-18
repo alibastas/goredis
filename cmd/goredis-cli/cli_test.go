@@ -132,7 +132,7 @@ func TestREPL(t *testing.T) {
 		`SET greeting "merhaba dünya"`,
 		`GET greeting`,
 		``,
-		`RPUSH`,
+		`NOSUCHCMD`,
 		`SET broken "quote`,
 		`INCR n`,
 		`quit`,
@@ -147,7 +147,7 @@ func TestREPL(t *testing.T) {
 	want := strings.Join([]string{
 		`test> OK`,
 		`test> "merhaba dünya"`,
-		`test> test> (error) ERR unknown command 'RPUSH', with args beginning with: `,
+		`test> test> (error) ERR unknown command 'NOSUCHCMD', with args beginning with: `,
 		`test> invalid argument(s): unbalanced quotes`,
 		`test> (integer) 1`,
 		`test> `,

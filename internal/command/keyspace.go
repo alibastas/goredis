@@ -60,12 +60,12 @@ func (h *handlers) persist(args []string) resp.Value {
 }
 
 func (h *handlers) keys(args []string) resp.Value {
-	keys := h.db.Keys(args[0])
-	elems := make([]resp.Value, len(keys))
-	for i, k := range keys {
-		elems[i] = resp.NewBulkString(k)
-	}
-	return resp.NewArray(elems...)
+	return stringsReply(h.db.Keys(args[0]))
+}
+
+// typeOf implements TYPE. It can't be called "type", which is a Go keyword.
+func (h *handlers) typeOf(args []string) resp.Value {
+	return resp.NewSimpleString(h.db.Type(args[0]))
 }
 
 func (h *handlers) dbsize(args []string) resp.Value {
