@@ -47,7 +47,10 @@ per-connection logs. Client flags: `-h` host, `-p` port.
 |------------|----------|
 | Connection | `PING`, `ECHO` |
 | Strings    | `GET`, `SET [NX\|XX] [EX s\|PX ms\|KEEPTTL]`, `INCR`, `DECR`, `INCRBY`, `DECRBY` |
-| Keyspace   | `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `KEYS`, `DBSIZE`, `FLUSHDB` |
+| Keyspace   | `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `KEYS`, `TYPE`, `DBSIZE`, `FLUSHDB` |
+| Hashes     | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN` |
+| Lists      | `LPUSH`, `RPUSH`, `LPOP [count]`, `RPOP [count]`, `LRANGE`, `LINDEX`, `LLEN` |
+| Sets       | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` |
 
 Replies and error messages match Redis, so existing clients behave the
 same way against goredis.
@@ -64,7 +67,7 @@ go test ./internal/resp -run='^$' -fuzz=FuzzReadValue -fuzztime=30s  # fuzz the 
 - [x] **Phase 0:** Project scaffolding
 - [x] **Phase 1:** TCP server and RESP2 protocol (`PING`, `ECHO`, pipelining)
 - [x] **Phase 2a:** Concurrency-safe storage engine, string and keyspace commands
-- [ ] **Phase 2b:** Hash, list and set data types
+- [x] **Phase 2b:** Hash, list and set data types
 - [ ] **Phase 2c:** Lazy and active key expiry, sharded keyspace, benchmarks
 - [ ] **Phase 3:** Persistence: append-only file (AOF) and snapshots
 - [ ] **Phase 4:** Pub/Sub
@@ -80,6 +83,8 @@ internal/resp/        RESP2 parser and writer (pure protocol, no I/O policy)
 internal/server/      TCP listener, one goroutine per connection, client state
 internal/command/     command table and argument validation
 internal/store/       storage engine: keyspace, data types, expiry
+internal/deque/       generic ring-buffer deque backing lists
+internal/glob/        Redis-style glob matching for KEYS
 internal/persistence/ AOF and snapshot
 internal/pubsub/      channel and pattern subscriptions
 internal/replication/ leader/follower sync
@@ -104,6 +109,37 @@ is one goroutine per client connection with a keyspace protected by locks.
 The keyspace starts behind a single `sync.RWMutex`. It will later be split
 into shards so that unrelated keys don't contend on the same lock. That change
 will only be made once a benchmark shows the difference.
+
+### One keyspace, typed values
+
+Every key maps to an entry whose value is a small interface implemented
+by four types: string, hash (`map[string]string`), set
+(`map[string]struct{}`) and list. Commands reach the concrete type
+through a single generic helper:
+
+```go
+h, found, err := as[hashValue](s.lookup(key, now))
+```
+
+The helper turns "key missing" into `found == false` and "key holds
+another type" into `ErrWrongType`. Each of the ~20 type-specific
+operations therefore handles WRONGTYPE in one line instead of repeating
+the type switch. Like in Redis, removing the last element of a
+collection removes the key itself, and `SET` replaces a value of any
+type.
+
+### Lists are ring buffers, not linked lists
+
+A list must support cheap pushes and pops at both ends (`LPUSH`, `RPOP`)
+and cheap indexing (`LINDEX`, `LRANGE`). A plain slice makes `LPUSH`
+O(n) because every element has to shift. A linked list (`container/list`)
+allocates a node per element and makes `LINDEX` O(n). `internal/deque`
+is a generic ring buffer: elements sit in a circular slice, and pushing
+to the front only moves a head index, so pushes, pops and indexing are
+all O(1). The buffer doubles when full and halves when it drops to a
+quarter full, which keeps memory bounded without resizing back and
+forth around a boundary. It is tested against a plain slice with 20,000
+random operations.
 
 ### Lazy expiry that never blocks readers
 
