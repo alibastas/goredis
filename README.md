@@ -14,17 +14,29 @@ It uses only the Go standard library.
 
 ## Quick start
 
-Requires Go 1.23 or newer. Available once Phase 1 lands.
+Requires Go 1.23 or newer.
 
 ```bash
-go run ./cmd/goredis          # listens on :6380
+go run ./cmd/goredis          # listens on 127.0.0.1:6380
 redis-cli -p 6380 PING        # PONG
+```
+
+Flags: `-addr` sets the listen address, `-debug` enables per-connection logs.
+
+No `redis-cli` at hand? The server also understands inline commands, so
+`telnet 127.0.0.1 6380` followed by `PING` works too.
+
+## Development
+
+```bash
+go test -race ./...                                              # unit and TCP tests
+go test ./internal/resp -run='^$' -fuzz=FuzzReadValue -fuzztime=30s  # fuzz the protocol parser
 ```
 
 ## Roadmap
 
 - [x] **Phase 0:** Project scaffolding
-- [ ] **Phase 1:** TCP server and RESP2 protocol (`PING`, `ECHO`, pipelining)
+- [x] **Phase 1:** TCP server and RESP2 protocol (`PING`, `ECHO`, pipelining)
 - [ ] **Phase 2a:** Concurrency-safe storage engine, string commands
       (`GET`, `SET` with `EX/PX/NX/XX`, `DEL`, `EXISTS`, `INCR`, `EXPIRE`, `TTL`, `PERSIST`, `KEYS`)
 - [ ] **Phase 2b:** Hash, list and set data types
@@ -67,6 +79,30 @@ The keyspace starts behind a single `sync.RWMutex`. It will later be split
 into shards so that unrelated keys don't contend on the same lock. That change
 will only be made once a benchmark shows the difference.
 
+### Replies are flushed only when the input buffer is empty
+
+Each connection has a buffered reader and a buffered writer. After a
+command runs, its reply goes into the write buffer. The buffer is flushed
+only when there are no more unread bytes from the client, right before the
+server would block waiting for more input. A client that pipelines many
+commands in one packet gets all the replies back in a single write, without
+any pipelining-specific code.
+
+### Untrusted lengths are never used to preallocate
+
+A bulk string header like `$536870912` is only a claim by the client.
+The parser caps lengths (512 MB per bulk string, 1M elements per array,
+4 KB per line). It also grows buffers as the data actually arrives
+rather than allocating the declared size up front, so a single header
+can't make the server reserve half a gigabyte.
+
+### Graceful shutdown
+
+On Ctrl+C or SIGTERM the server closes the listener, closes every client
+connection and waits for all connection goroutines to return before
+exiting. Once persistence exists, this is the point where buffered data
+gets flushed to disk.
+
 ### RESP2 only
 
 RESP2 is what `redis-cli` and every client library support by default. RESP3
@@ -79,10 +115,11 @@ Redis's RDB format. RDB compatibility would be a lot of work that teaches
 little. What matters here is atomic writes (write to a temp file, fsync,
 rename) and detecting corruption.
 
-### Default port 6380
+### Default address 127.0.0.1:6380
 
 goredis defaults to port 6380 so it can run next to a real Redis instance on
-6379.
+6379. Like Redis, it only listens on localhost unless told otherwise,
+because there is no authentication.
 
 ## License
 
