@@ -12,16 +12,17 @@ const (
 // needed, and returns the new length. Values are pushed one at a time, so
 // pushing a, b, c to the left gives the list c, b, a, as in Redis.
 func (s *Store) Push(key string, end End, values ...string) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	l, found, err := as[*listValue](s.lookupForWrite(key, s.now()))
+	l, found, err := as[*listValue](sh.lookupForWrite(key, s.now()))
 	if err != nil {
 		return 0, err
 	}
 	if !found {
 		l = &listValue{}
-		s.data[key] = entry{value: l}
+		sh.put(key, entry{value: l})
 	}
 
 	for _, v := range values {
@@ -38,10 +39,11 @@ func (s *Store) Push(key string, end End, values ...string) (int, error) {
 // returns them in the order they were removed. found is false if the key
 // does not exist.
 func (s *Store) Pop(key string, end End, count int) (popped []string, found bool, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	l, found, err := as[*listValue](s.lookupForWrite(key, s.now()))
+	l, found, err := as[*listValue](sh.lookupForWrite(key, s.now()))
 	if err != nil || !found {
 		return nil, found, err
 	}
@@ -60,7 +62,7 @@ func (s *Store) Pop(key string, end End, count int) (popped []string, found bool
 		}
 		popped = append(popped, v)
 	}
-	s.removeIfEmpty(key, l.items.Len())
+	sh.removeIfEmpty(key, l.items.Len())
 	return popped, true, nil
 }
 
@@ -69,10 +71,11 @@ func (s *Store) Pop(key string, end End, count int) (popped []string, found bool
 // either end are clamped, and an empty range yields an empty slice rather
 // than an error, matching Redis.
 func (s *Store) LRange(key string, start, stop int) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	l, found, err := as[*listValue](s.lookup(key, s.now()))
+	l, found, err := as[*listValue](sh.lookup(key, s.now()))
 	if err != nil || !found {
 		return []string{}, err
 	}
@@ -99,10 +102,11 @@ func (s *Store) LRange(key string, start, stop int) ([]string, error) {
 // LIndex returns the element at index, where negative indexes count from
 // the end. ok is false if the index is out of range or the key is missing.
 func (s *Store) LIndex(key string, index int) (elem string, ok bool, err error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	l, found, err := as[*listValue](s.lookup(key, s.now()))
+	l, found, err := as[*listValue](sh.lookup(key, s.now()))
 	if err != nil || !found {
 		return "", false, err
 	}
@@ -116,10 +120,11 @@ func (s *Store) LIndex(key string, index int) (elem string, ok bool, err error) 
 }
 
 func (s *Store) LLen(key string) (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	l, found, err := as[*listValue](s.lookup(key, s.now()))
+	l, found, err := as[*listValue](sh.lookup(key, s.now()))
 	if err != nil || !found {
 		return 0, err
 	}

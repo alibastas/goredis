@@ -5,9 +5,10 @@ package store
 
 import (
 	"errors"
+	"hash/maphash"
 	"math"
+	"slices"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/alibastas/goredis/internal/glob"
@@ -20,6 +21,12 @@ var (
 
 // NoExpiry is returned by TTL for a key that exists but never expires.
 const NoExpiry time.Duration = -1
+
+// DefaultShards is the number of shards a Store gets unless told otherwise.
+// It was picked with BenchmarkStore on a 20-thread machine, where 256
+// shards were about 4x faster than one global lock and more consistent
+// than 64. See the README for the numbers.
+const DefaultShards = 256
 
 type entry struct {
 	value value
@@ -34,73 +41,137 @@ func (e entry) expired(now time.Time) bool {
 
 // Store is a concurrency-safe key-value map with per-key expiry.
 //
-// Expired keys are removed lazily: a key whose deadline has passed is
-// treated as missing by every operation, and is physically deleted the next
-// time a write touches it. Read operations only hold a read lock, so they
-// never delete anything; that way concurrent readers don't block each
-// other. Background cleanup of keys nobody touches comes in a later phase.
+// The keyspace is split into shards, each with its own lock, and every key
+// always lives in the same shard. Commands on keys in different shards run
+// in parallel. Commands that touch several keys lock every shard involved,
+// always in ascending shard order, so two such commands can never end up
+// waiting for each other (deadlock).
+//
+// Expired keys are removed in two ways. Lazily: a key whose deadline has
+// passed is treated as missing by every operation and deleted the next
+// time a write touches it. Actively: RunActiveExpiry samples keys in the
+// background and deletes expired ones nobody asks for.
 type Store struct {
-	mu   sync.RWMutex
-	data map[string]entry
+	shards []*shard
+	// seed randomizes which shard a key lands in, differently on every
+	// start. With a fixed hash function, a client could craft many keys
+	// that all fall into one shard and undo the benefit of sharding.
+	seed maphash.Seed
 	now  func() time.Time
+
+	// expiryCursor is the shard the next active expiry cycle starts at. It
+	// is only touched by the goroutine running active expiry.
+	expiryCursor int
+}
+
+// Options configures a Store. The zero value gives the defaults.
+type Options struct {
+	// Shards is the number of shards. Zero means DefaultShards. One shard
+	// behaves like a single global lock, which benchmarks compare against.
+	Shards int
+	// Now reads the current time. Tests pass a fake clock to control
+	// expiry without sleeping. Nil means time.Now.
+	Now func() time.Time
 }
 
 func New() *Store {
-	return NewWithClock(time.Now)
+	return NewWithOptions(Options{})
 }
 
-// NewWithClock creates a store that reads the current time from now. Tests
-// use it to control time instead of sleeping.
+// NewWithClock creates a store with default options that reads the current
+// time from now.
 func NewWithClock(now func() time.Time) *Store {
-	return &Store{data: make(map[string]entry), now: now}
+	return NewWithOptions(Options{Now: now})
 }
 
-// lookup returns the entry for key if it exists and has not expired.
-// The caller must hold s.mu, for reading or writing.
-func (s *Store) lookup(key string, now time.Time) (entry, bool) {
-	e, ok := s.data[key]
-	if !ok || e.expired(now) {
-		return entry{}, false
+func NewWithOptions(opts Options) *Store {
+	if opts.Shards <= 0 {
+		opts.Shards = DefaultShards
 	}
-	return e, true
-}
-
-// lookupForWrite is lookup for callers holding the write lock: an expired
-// entry it runs into is deleted on the spot.
-func (s *Store) lookupForWrite(key string, now time.Time) (entry, bool) {
-	e, ok := s.data[key]
-	if ok && e.expired(now) {
-		delete(s.data, key)
-		return entry{}, false
+	if opts.Now == nil {
+		opts.Now = time.Now
 	}
-	return e, ok
+	s := &Store{
+		shards: make([]*shard, opts.Shards),
+		seed:   maphash.MakeSeed(),
+		now:    opts.Now,
+	}
+	for i := range s.shards {
+		s.shards[i] = newShard()
+	}
+	return s
 }
 
-// removeIfEmpty deletes key once a collection stored under it has no
-// elements left. Redis never keeps empty hashes, lists or sets around:
-// removing the last element removes the key. The caller must hold the
-// write lock.
-func (s *Store) removeIfEmpty(key string, size int) {
-	if size == 0 {
-		delete(s.data, key)
+func (s *Store) shardIndex(key string) int {
+	return int(maphash.String(s.seed, key) % uint64(len(s.shards)))
+}
+
+func (s *Store) shardFor(key string) *shard {
+	return s.shards[s.shardIndex(key)]
+}
+
+// lockKeys locks every shard that holds one of keys and returns a function
+// that unlocks them again. Each shard is locked once, even if several keys
+// share it, and shards are always locked in ascending order: if every
+// caller follows the same order, no two callers can each hold a lock the
+// other is waiting for.
+func (s *Store) lockKeys(keys []string, write bool) (unlock func()) {
+	indexes := make([]int, len(keys))
+	for i, key := range keys {
+		indexes[i] = s.shardIndex(key)
+	}
+	slices.Sort(indexes)
+	return s.lockShards(slices.Compact(indexes), write)
+}
+
+// lockAll locks every shard, in order, for operations that need a
+// consistent view of the whole keyspace.
+func (s *Store) lockAll(write bool) (unlock func()) {
+	indexes := make([]int, len(s.shards))
+	for i := range indexes {
+		indexes[i] = i
+	}
+	return s.lockShards(indexes, write)
+}
+
+func (s *Store) lockShards(indexes []int, write bool) (unlock func()) {
+	for _, i := range indexes {
+		if write {
+			s.shards[i].mu.Lock()
+		} else {
+			s.shards[i].mu.RLock()
+		}
+	}
+	return func() {
+		for _, i := range slices.Backward(indexes) {
+			if write {
+				s.shards[i].mu.Unlock()
+			} else {
+				s.shards[i].mu.RUnlock()
+			}
+		}
 	}
 }
 
 // Get returns the string stored at key. It fails with ErrWrongType if the
 // key holds a hash, list or set.
 func (s *Store) Get(key string) (string, bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v, found, err := as[stringValue](s.lookup(key, s.now()))
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+
+	v, found, err := as[stringValue](sh.lookup(key, s.now()))
 	return string(v), found, err
 }
 
 // Type returns the name of the type stored at key ("string", "hash",
 // "list" or "set"), or "none" if the key does not exist.
 func (s *Store) Type(key string) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	e, ok := s.lookup(key, s.now())
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+
+	e, ok := sh.lookup(key, s.now())
 	if !ok {
 		return "none"
 	}
@@ -128,11 +199,12 @@ type SetOptions struct {
 // the key held before, whatever its type. It returns false if the write was
 // skipped because opts.Condition did not hold.
 func (s *Store) Set(key, val string, opts SetOptions) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
 	now := s.now()
-	old, exists := s.lookupForWrite(key, now)
+	old, exists := sh.lookupForWrite(key, now)
 	if (opts.Condition == IfNotExists && exists) || (opts.Condition == IfExists && !exists) {
 		return false
 	}
@@ -144,20 +216,23 @@ func (s *Store) Set(key, val string, opts SetOptions) bool {
 	case opts.KeepTTL:
 		e.expiresAt = old.expiresAt
 	}
-	s.data[key] = e
+	sh.put(key, e)
 	return true
 }
 
-// Delete removes the given keys and returns how many of them existed.
+// Delete removes the given keys and returns how many of them existed. All
+// keys are removed atomically: no other command sees some of them gone and
+// others still there.
 func (s *Store) Delete(keys ...string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock := s.lockKeys(keys, true)
+	defer unlock()
 
 	now := s.now()
 	deleted := 0
 	for _, key := range keys {
-		if _, ok := s.lookupForWrite(key, now); ok {
-			delete(s.data, key)
+		sh := s.shardFor(key)
+		if _, ok := sh.lookupForWrite(key, now); ok {
+			sh.remove(key)
 			deleted++
 		}
 	}
@@ -167,13 +242,13 @@ func (s *Store) Delete(keys ...string) int {
 // Exists returns how many of the given keys exist. A key listed twice is
 // counted twice, like in Redis.
 func (s *Store) Exists(keys ...string) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	unlock := s.lockKeys(keys, false)
+	defer unlock()
 
 	now := s.now()
 	n := 0
 	for _, key := range keys {
-		if _, ok := s.lookup(key, now); ok {
+		if _, ok := s.shardFor(key).lookup(key, now); ok {
 			n++
 		}
 	}
@@ -186,10 +261,11 @@ func (s *Store) Exists(keys ...string) int {
 // Reading, adding and writing back all happen under one write lock, so
 // concurrent increments never lose an update.
 func (s *Store) IncrBy(key string, delta int64) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	e, exists := s.lookupForWrite(key, s.now())
+	e, exists := sh.lookupForWrite(key, s.now())
 	str, _, err := as[stringValue](e, exists)
 	if err != nil {
 		return 0, err
@@ -209,7 +285,7 @@ func (s *Store) IncrBy(key string, delta int64) (int64, error) {
 	}
 	current += delta
 	e.value = stringValue(strconv.FormatInt(current, 10))
-	s.data[key] = e
+	sh.put(key, e)
 	return current, nil
 }
 
@@ -217,46 +293,49 @@ func (s *Store) IncrBy(key string, delta int64) (int64, error) {
 // key right away, which is what Redis does too. It returns false if the key
 // does not exist.
 func (s *Store) Expire(key string, ttl time.Duration) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
 	now := s.now()
-	e, ok := s.lookupForWrite(key, now)
+	e, ok := sh.lookupForWrite(key, now)
 	if !ok {
 		return false
 	}
 	if ttl <= 0 {
-		delete(s.data, key)
+		sh.remove(key)
 		return true
 	}
 	e.expiresAt = now.Add(ttl)
-	s.data[key] = e
+	sh.put(key, e)
 	return true
 }
 
 // Persist removes the expiry from key. It returns false if the key does not
 // exist or had no expiry.
 func (s *Store) Persist(key string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	e, ok := s.lookupForWrite(key, s.now())
+	e, ok := sh.lookupForWrite(key, s.now())
 	if !ok || e.expiresAt.IsZero() {
 		return false
 	}
 	e.expiresAt = time.Time{}
-	s.data[key] = e
+	sh.put(key, e)
 	return true
 }
 
 // TTL returns how long key has left to live. The second result is false if
 // the key does not exist. For a key without expiry it returns NoExpiry.
 func (s *Store) TTL(key string) (time.Duration, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
 	now := s.now()
-	e, ok := s.lookup(key, now)
+	e, ok := sh.lookup(key, now)
 	if !ok {
 		return 0, false
 	}
@@ -270,30 +349,40 @@ func (s *Store) TTL(key string) (time.Duration, bool) {
 // order. It scans the whole keyspace, so like in Redis it is meant for
 // debugging rather than for production traffic.
 func (s *Store) Keys(pattern string) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	unlock := s.lockAll(false)
+	defer unlock()
 
 	now := s.now()
 	keys := []string{}
-	for key, e := range s.data {
-		if !e.expired(now) && glob.Match(pattern, key) {
-			keys = append(keys, key)
+	for _, sh := range s.shards {
+		for key, e := range sh.data {
+			if !e.expired(now) && glob.Match(pattern, key) {
+				keys = append(keys, key)
+			}
 		}
 	}
 	return keys
 }
 
-// Len returns the number of keys in the store. Until they are cleaned up,
-// expired keys are included, which matches Redis's DBSIZE.
+// Len returns the number of keys in the store. Expired keys that haven't
+// been cleaned up yet are included, which matches Redis's DBSIZE.
 func (s *Store) Len() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.data)
+	unlock := s.lockAll(false)
+	defer unlock()
+
+	n := 0
+	for _, sh := range s.shards {
+		n += len(sh.data)
+	}
+	return n
 }
 
 // Flush removes every key.
 func (s *Store) Flush() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data = make(map[string]entry)
+	unlock := s.lockAll(true)
+	defer unlock()
+
+	for _, sh := range s.shards {
+		sh.reset()
+	}
 }

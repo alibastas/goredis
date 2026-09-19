@@ -7,16 +7,17 @@ func (s *Store) HSet(key string, pairs ...string) (int, error) {
 	if len(pairs)%2 != 0 {
 		panic("store: HSet needs field-value pairs")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	h, found, err := as[hashValue](s.lookupForWrite(key, s.now()))
+	h, found, err := as[hashValue](sh.lookupForWrite(key, s.now()))
 	if err != nil {
 		return 0, err
 	}
 	if !found {
 		h = hashValue{}
-		s.data[key] = entry{value: h}
+		sh.put(key, entry{value: h})
 	}
 
 	added := 0
@@ -31,10 +32,11 @@ func (s *Store) HSet(key string, pairs ...string) (int, error) {
 }
 
 func (s *Store) HGet(key, field string) (string, bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	h, _, err := as[hashValue](s.lookup(key, s.now()))
+	h, _, err := as[hashValue](sh.lookup(key, s.now()))
 	if err != nil {
 		return "", false, err
 	}
@@ -46,10 +48,11 @@ func (s *Store) HGet(key, field string) (string, bool, error) {
 
 // HDel removes fields from the hash at key and returns how many existed.
 func (s *Store) HDel(key string, fields ...string) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	h, found, err := as[hashValue](s.lookupForWrite(key, s.now()))
+	h, found, err := as[hashValue](sh.lookupForWrite(key, s.now()))
 	if err != nil || !found {
 		return 0, err
 	}
@@ -60,17 +63,18 @@ func (s *Store) HDel(key string, fields ...string) (int, error) {
 			deleted++
 		}
 	}
-	s.removeIfEmpty(key, len(h))
+	sh.removeIfEmpty(key, len(h))
 	return deleted, nil
 }
 
 // HGetAll returns every field and value of the hash at key as one flat
 // slice: field1, value1, field2, value2, ... in no particular order.
 func (s *Store) HGetAll(key string) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	h, _, err := as[hashValue](s.lookup(key, s.now()))
+	h, _, err := as[hashValue](sh.lookup(key, s.now()))
 	if err != nil {
 		return nil, err
 	}
@@ -87,9 +91,10 @@ func (s *Store) HExists(key, field string) (bool, error) {
 }
 
 func (s *Store) HLen(key string) (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	h, _, err := as[hashValue](s.lookup(key, s.now()))
+	h, _, err := as[hashValue](sh.lookup(key, s.now()))
 	return len(h), err
 }
