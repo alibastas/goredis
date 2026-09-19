@@ -39,7 +39,15 @@ OK
 `redis-cli -p 6380` works as well.
 
 Server flags: `-addr` sets the listen address, `-debug` enables
-per-connection logs. Client flags: `-h` host, `-p` port.
+per-connection logs, `-shards` sets the number of keyspace shards.
+Client flags: `-h` host, `-p` port.
+
+Measure a running server with the bundled load generator, a small
+`redis-benchmark` look-alike:
+
+```bash
+go run ./cmd/goredis-benchmark -c 50 -n 200000 -P 16 -t set,get,incr,lpush
+```
 
 ## Supported commands
 
@@ -60,6 +68,7 @@ same way against goredis.
 ```bash
 go test -race ./...                                              # unit and TCP tests
 go test ./internal/resp -run='^$' -fuzz=FuzzReadValue -fuzztime=30s  # fuzz the protocol parser
+go test ./internal/store -run='^$' -bench=Store -benchtime=2s        # shard-count benchmark
 ```
 
 ## Roadmap
@@ -68,7 +77,7 @@ go test ./internal/resp -run='^$' -fuzz=FuzzReadValue -fuzztime=30s  # fuzz the 
 - [x] **Phase 1:** TCP server and RESP2 protocol (`PING`, `ECHO`, pipelining)
 - [x] **Phase 2a:** Concurrency-safe storage engine, string and keyspace commands
 - [x] **Phase 2b:** Hash, list and set data types
-- [ ] **Phase 2c:** Lazy and active key expiry, sharded keyspace, benchmarks
+- [x] **Phase 2c:** Active key expiry, sharded keyspace, benchmarks
 - [ ] **Phase 3:** Persistence: append-only file (AOF) and snapshots
 - [ ] **Phase 4:** Pub/Sub
 - [ ] **Phase 5:** Leader/follower replication
@@ -79,6 +88,7 @@ go test ./internal/resp -run='^$' -fuzz=FuzzReadValue -fuzztime=30s  # fuzz the 
 ```
 cmd/goredis/          server entry point: flags, config, startup
 cmd/goredis-cli/      interactive command-line client
+cmd/goredis-benchmark/ load generator reporting throughput and latency
 internal/resp/        RESP2 parser and writer (pure protocol, no I/O policy)
 internal/server/      TCP listener, one goroutine per connection, client state
 internal/command/     command table and argument validation
@@ -106,9 +116,83 @@ with each phase.
 Redis runs commands on a single-threaded event loop. goroutines are cheap and
 the Go runtime multiplexes them onto OS threads, so the idiomatic Go approach
 is one goroutine per client connection with a keyspace protected by locks.
-The keyspace starts behind a single `sync.RWMutex`. It will later be split
-into shards so that unrelated keys don't contend on the same lock. That change
-will only be made once a benchmark shows the difference.
+
+### A sharded keyspace, justified by measurement
+
+The keyspace started out as one map behind one `sync.RWMutex`. It is now
+split into 256 shards, each with its own lock. A key's shard is picked with
+`hash/maphash`, whose seed is random on every start. With a fixed hash,
+a client could craft keys that all land in one shard and bring back the
+contention (hash flooding).
+
+The change was only made after measuring it. `BenchmarkStore` hits the
+store from 20 goroutines on a 20-thread i7-13700H. The old single-lock
+store and the new one were run interleaved, three rounds each:
+
+| Workload                | 1 global lock  | 256 shards     |
+|-------------------------|----------------|----------------|
+| 90% GET / 10% SET       | 510–573 ns/op  | 125–137 ns/op  |
+| 50% GET / 50% SET       | 806–917 ns/op  | 185–204 ns/op  |
+
+That is about 4x on both workloads. Reads benefit too, even though an
+`RWMutex` lets readers in together: every `RLock` still updates a shared
+counter, and 20 cores fighting over that one cache line is its own
+bottleneck. With 256 shards, that counter is split 256 ways as well.
+
+End to end, over TCP with `goredis-benchmark` (50 clients, 200k requests,
+median of five runs, thousands of requests per second):
+
+| Command | Pipeline | 1 shard | 256 shards |
+|---------|---------:|--------:|-----------:|
+| SET     | 16       | 261k    | **663k**   |
+| INCR    | 16       | 250k    | **870k**   |
+| GET     | 16       | 864k    | 888k       |
+| LPUSH   | 16       | 445k    | 413k       |
+| SET     | 1        | 138k    | 133k       |
+| GET     | 1        | 145k    | 143k       |
+
+This is what the design predicts. Writes gain 2.5–3.5x once pipelining
+takes network round trips out of the picture. GET barely moves because
+readers already shared the lock. `LPUSH` gains nothing because every client
+pushes to the same list, and a single hot key always lives in a single
+shard. Without pipelining, each request pays a full loopback round trip,
+which dwarfs the time spent holding a lock, so sharding makes no
+measurable difference there.
+
+Two lessons came out of this. First, a single benchmark run is not
+evidence: the first single-lock measurement came out 2x faster than the
+same code measured an hour later, so the numbers above come from
+interleaved runs. Second, latency percentiles from this Windows machine
+are not reported: Go's clock there advances in steps of about 0.4 ms,
+so sub-millisecond latencies all read as zero.
+
+### Multi-key commands lock shards in a fixed order
+
+`DEL a b c` must be atomic, so it locks every shard holding one of its
+keys before touching any. If two commands locked their shards in the
+order their keys were given, `DEL a c` and `DEL c a` could each grab one
+shard and wait forever for the other. Every multi-key operation therefore
+locks shards in ascending index order, which rules out that cycle. A test
+runs 16 goroutines issuing overlapping multi-key commands in random key
+order. When the sort is removed from the locking code, the test hangs
+and fails, so it really catches the problem.
+
+### Active expiry by random sampling
+
+Lazy expiry alone leaks memory: keys that expire but are never read again
+(sessions of users who never come back) would stay in RAM forever.
+Scanning every key would stall the server. goredis uses Redis's
+approach instead. Ten times a second it samples 20 keys that have a TTL
+in each shard and deletes the expired ones. If more than a quarter of a
+sample was expired, it samples that shard again. Each cycle has a 25 ms
+time budget, and the next cycle resumes where the last one stopped.
+
+The work scales with the mess: an idle keyspace costs almost nothing,
+while a burst of expirations gets cleaned aggressively. Each shard keeps
+a separate index of keys that have a TTL (Redis's `expires` dict), so
+sampling never wastes time on keys that can't expire. The sample itself
+comes from ranging over that index, because Go starts every map iteration
+at a random position.
 
 ### One keyspace, typed values
 
@@ -145,11 +229,10 @@ random operations.
 
 Each key stores an optional deadline. Once the deadline has passed, every
 command treats the key as missing. Reads (`GET`, `EXISTS`, `TTL`) only take
-the read side of the `RWMutex`, so they skip expired keys without deleting
-them. That way concurrent readers never wait for each other. Writes
-already hold the exclusive lock, so they delete any expired key they come
-across. Keys that nobody touches again are left for the background
-expiry cycle added in Phase 2c.
+the read side of their shard's `RWMutex`, so they skip expired keys without
+deleting them. That way concurrent readers never wait for each other.
+Writes already hold the exclusive lock, so they delete any expired key they
+come across. Keys that nobody touches again are removed by active expiry.
 
 ### Atomic read-modify-write
 
