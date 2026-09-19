@@ -28,6 +28,7 @@ func main() {
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:6380", "address to listen on")
 	debug := flag.Bool("debug", false, "enable debug logging")
+	shards := flag.Int("shards", store.DefaultShards, "number of keyspace shards (1 means a single global lock)")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -46,9 +47,25 @@ func run() error {
 	}
 	logger.Info("goredis is ready to accept connections", "addr", ln.Addr().String())
 
-	srv := server.New(command.NewRegistry(store.New()), logger)
-	if err := srv.Serve(ctx, ln); err != nil {
-		return err
+	db := store.NewWithOptions(store.Options{Shards: *shards})
+
+	// Active expiry runs next to the server for as long as ctx lives.
+	expiryDone := make(chan struct{})
+	go func() {
+		defer close(expiryDone)
+		db.RunActiveExpiry(ctx)
+	}()
+
+	srv := server.New(command.NewRegistry(db), logger)
+	serveErr := srv.Serve(ctx, ln)
+
+	// Serve can also return because accepting failed, with ctx still live.
+	// Cancel it either way so the expiry goroutine stops, then wait for it.
+	stop()
+	<-expiryDone
+
+	if serveErr != nil {
+		return serveErr
 	}
 	logger.Info("goredis shut down")
 	return nil
