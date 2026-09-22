@@ -38,8 +38,26 @@ OK
 `goredis-cli GET greeting` runs a single command and exits. The official
 `redis-cli -p 6380` works as well.
 
+Data survives a restart. The keyspace is saved to a snapshot file on
+shutdown, on `SAVE` and on `BGSAVE`, and loaded again at startup:
+
+```
+127.0.0.1:6380> BGSAVE
+Background saving started
+                                  # restart the server
+127.0.0.1:6380> GET greeting
+"hello world"
+127.0.0.1:6380> TTL greeting
+(integer) 41
+```
+
+Expiry times are stored as absolute deadlines, so a key that had 60
+seconds left before a 19-second downtime comes back with 41, not 60.
+
 Server flags: `-addr` sets the listen address, `-debug` enables
-per-connection logs, `-shards` sets the number of keyspace shards.
+per-connection logs, `-shards` sets the number of keyspace shards,
+`-dir` and `-dbfilename` say where the snapshot lives, and
+`-snapshot=false` turns persistence off entirely.
 Client flags: `-h` host, `-p` port.
 
 Measure a running server with the bundled load generator, a small
@@ -59,6 +77,7 @@ go run ./cmd/goredis-benchmark -c 50 -n 200000 -P 16 -t set,get,incr,lpush
 | Hashes     | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN` |
 | Lists      | `LPUSH`, `RPUSH`, `LPOP [count]`, `RPOP [count]`, `LRANGE`, `LINDEX`, `LLEN` |
 | Sets       | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` |
+| Persistence| `SAVE`, `BGSAVE`, `LASTSAVE` |
 
 Replies and error messages match Redis, so existing clients behave the
 same way against goredis.
@@ -69,6 +88,7 @@ same way against goredis.
 go test -race ./...                                              # unit and TCP tests
 go test ./internal/resp -run='^$' -fuzz=FuzzReadValue -fuzztime=30s  # fuzz the protocol parser
 go test ./internal/store -run='^$' -bench=Store -benchtime=2s        # shard-count benchmark
+go test ./internal/persistence/snapshot -run='^$' -fuzz=FuzzDecode   # fuzz the snapshot parser
 ```
 
 ## Roadmap
@@ -78,7 +98,9 @@ go test ./internal/store -run='^$' -bench=Store -benchtime=2s        # shard-cou
 - [x] **Phase 2a:** Concurrency-safe storage engine, string and keyspace commands
 - [x] **Phase 2b:** Hash, list and set data types
 - [x] **Phase 2c:** Active key expiry, sharded keyspace, benchmarks
-- [ ] **Phase 3:** Persistence: append-only file (AOF) and snapshots
+- [x] **Phase 3a:** Snapshots: `SAVE`, `BGSAVE`, crash-safe file replacement
+- [ ] **Phase 3b:** Append-only file with selectable fsync policies
+- [ ] **Phase 3c:** AOF rewrite
 - [ ] **Phase 4:** Pub/Sub
 - [ ] **Phase 5:** Leader/follower replication
 - [ ] **Phase 6:** Leader election and automatic failover with Raft
@@ -95,7 +117,9 @@ internal/command/     command table and argument validation
 internal/store/       storage engine: keyspace, data types, expiry
 internal/deque/       generic ring-buffer deque backing lists
 internal/glob/        Redis-style glob matching for KEYS
-internal/persistence/ AOF and snapshot
+internal/persistence/ crash-safe file replacement shared by the two below
+internal/persistence/snapshot/ point-in-time dump of the whole keyspace
+internal/persistence/aof/  append-only command log
 internal/pubsub/      channel and pattern subscriptions
 internal/replication/ leader/follower sync
 internal/raft/        leader election
@@ -277,20 +301,85 @@ can't make the server reserve half a gigabyte.
 
 On Ctrl+C or SIGTERM the server closes the listener, closes every client
 connection and waits for all connection goroutines to return before
-exiting. Once persistence exists, this is the point where buffered data
-gets flushed to disk.
+exiting. Only then, with nothing else touching the keyspace, does it wait
+for any background save to finish and write a final snapshot.
 
 ### RESP2 only
 
 RESP2 is what `redis-cli` and every client library support by default. RESP3
 adds richer types but no new ideas relevant to this project.
 
-### Custom snapshot format
+### Writing a file a crash cannot catch halfway
 
-Snapshots use a small versioned binary format with a checksum instead of
-Redis's RDB format. RDB compatibility would be a lot of work that teaches
-little. What matters here is atomic writes (write to a temp file, fsync,
-rename) and detecting corruption.
+Writing a snapshot straight over the previous one has a window in which
+neither version is intact: if the machine loses power mid-write, the only
+copy on disk is half old and half new. Every save therefore goes through
+the same four steps, in `internal/persistence`:
+
+```
+write  -> dump.goredis.tmp-1234
+fsync  -> the bytes are really on the disk, not just in the OS cache
+rename -> the temp file becomes dump.goredis in one indivisible step
+fsync  -> the directory, so the rename itself survives a power cut
+```
+
+Renaming is atomic in the operating system while writing is not, so at
+every instant the real name points at one complete file. The first fsync
+is what makes that guarantee real: without it the rename can land while
+the contents are still sitting in the kernel's write cache, which is how
+people end up with a snapshot full of zeroes after a power cut. The temp
+file has to be in the same directory, because a rename across file
+systems is a copy and not atomic. Directory fsync is a no-op on Windows,
+where directories cannot be opened for syncing, so that one function has
+two build-tagged versions.
+
+### BGSAVE without fork: copy under the lock, write outside it
+
+Redis takes a background snapshot by calling `fork()`. The child gets a
+frozen view of memory that the kernel keeps cheap through copy-on-write,
+and writes it out while the parent keeps serving. Go cannot do this: the
+runtime's threads do not survive a fork, so a forked child of a Go
+program is not allowed to do much more than `exec`.
+
+The equivalent here splits the work differently. `Store.Export` copies the
+keyspace while holding every shard's read lock, and `BGSAVE` hands that
+copy to a goroutine which does the slow part, the disk, with no locks
+held at all. Writers wait for the copy, not for the write; readers never
+wait. The price is memory: while the save runs, the copy lives next to
+the real keyspace. Only the maps and slices are duplicated, not the
+strings inside them, because strings in Go are immutable and can be
+shared safely.
+
+`SAVE` is the same thing without the goroutine, and a mutex makes sure
+only one save is in flight, so two of them can't race to replace the same
+file.
+
+### A snapshot format of its own, with a checksum
+
+Snapshots use a small versioned binary format rather than Redis's RDB.
+Byte-level RDB compatibility is a large amount of work that teaches
+little; the parts worth building are elsewhere.
+
+```
+"GOREDIS" | version | record... | 0x00 | crc64 (8 bytes)
+```
+
+A record is a kind byte, an expiry, a key and a payload, with every
+length written as a varint so the common small ones cost one byte. The
+trailing CRC-64 covers everything before it, and a file whose checksum,
+magic or version does not match is refused rather than loaded. Starting
+with silently incomplete data is worse than not starting: the server
+would then happily save that damaged state back over the good one.
+
+Expiry is stored as an absolute Unix timestamp, not as the remaining
+time. A key with 60 seconds left that is reloaded 19 seconds later has
+41 seconds left, not 60 again, and a key whose deadline passed while the
+server was down is dropped on load instead of coming back from the dead.
+
+The decoder treats the file as untrusted input, exactly like the RESP
+parser treats a client: lengths are capped and never used to preallocate,
+so a corrupt header claiming a billion elements fails instead of
+reserving the memory first. `FuzzDecode` runs in CI to keep it that way.
 
 ### Default address 127.0.0.1:6380
 
