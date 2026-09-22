@@ -20,6 +20,7 @@ go.work.sum
 # Data files produced by the server
 *.aof
 *.snap
+dump.goredis
 /data/
 
 # Environment

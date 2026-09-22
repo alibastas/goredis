@@ -37,10 +37,31 @@ type Registry struct {
 	commands map[string]command
 }
 
+// Option configures a Registry. Options are Go's usual answer to a
+// constructor that keeps growing: the required argument stays positional,
+// anything optional is a function the caller passes in, and existing call
+// sites keep compiling when a new one is added.
+type Option func(*options)
+
+type options struct {
+	persister Persister
+}
+
+// WithPersistence enables the SAVE, BGSAVE and LASTSAVE commands. Without
+// it they report that persistence is disabled.
+func WithPersistence(p Persister) Option {
+	return func(o *options) { o.persister = p }
+}
+
 // NewRegistry creates a registry whose data commands operate on db.
-func NewRegistry(db *store.Store) *Registry {
+func NewRegistry(db *store.Store, opts ...Option) *Registry {
+	var cfg options
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	r := &Registry{commands: make(map[string]command)}
-	h := &handlers{db: db}
+	h := &handlers{db: db, persister: cfg.persister}
 
 	// Connection
 	r.register("PING", -1, ping)
@@ -90,6 +111,11 @@ func NewRegistry(db *store.Store) *Registry {
 	r.register("SMEMBERS", 2, h.smembers)
 	r.register("SISMEMBER", 3, h.sismember)
 	r.register("SCARD", 2, h.scard)
+
+	// Persistence
+	r.register("SAVE", 1, h.save)
+	r.register("BGSAVE", 1, h.bgsave)
+	r.register("LASTSAVE", 1, h.lastsave)
 	return r
 }
 
@@ -98,6 +124,8 @@ func NewRegistry(db *store.Store) *Registry {
 // func(args []string) resp.Value with h already bound to it.
 type handlers struct {
 	db *store.Store
+	// persister is nil when the server runs without persistence.
+	persister Persister
 }
 
 func (r *Registry) register(name string, arity int, h Handler) {
