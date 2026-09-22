@@ -32,3 +32,6 @@ jobs:
 
       - name: Fuzz RESP reader
         run: go test ./internal/resp -run='^$' -fuzz=FuzzReadValue -fuzztime=30s
+
+      - name: Fuzz snapshot decoder
+        run: go test ./internal/persistence/snapshot -run='^$' -fuzz=FuzzDecode -fuzztime=30s
