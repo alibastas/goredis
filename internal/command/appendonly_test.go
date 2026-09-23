@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alibastas/goredis/internal/resp"
 	"github.com/alibastas/goredis/internal/store"
 )
 
@@ -16,6 +17,7 @@ import (
 type fakeLog struct {
 	appended [][]string
 	flushes  int
+	rewrites int
 	err      error
 }
 
@@ -231,4 +233,30 @@ func TestReplay(t *testing.T) {
 	if !strings.Contains(err.Error(), "unknown command") {
 		t.Errorf("Replay error = %q, want it to mention the unknown command", err)
 	}
+}
+
+func (l *fakeLog) Rewrite() error {
+	l.rewrites++
+	return l.err
+}
+
+func TestBgrewriteaof(t *testing.T) {
+	h := newLogHarness(t)
+	h.expect(resp.NewSimpleString("Background append only file rewriting started"), "BGREWRITEAOF")
+	if h.log.rewrites != 1 {
+		t.Fatalf("the log saw %d rewrites, want 1", h.log.rewrites)
+	}
+
+	h.log.err = errors.New("Background append only file rewriting already in progress")
+	h.expect(errReply("ERR Background append only file rewriting already in progress"), "BGREWRITEAOF")
+
+	// BGREWRITEAOF is not itself a write, so it must not end up in the log.
+	h.wantLog()
+}
+
+// TestBgrewriteaofWithoutALog covers a server started without the
+// append-only file: the command answers clearly instead of looking unknown.
+func TestBgrewriteaofWithoutALog(t *testing.T) {
+	h := newHarness(t)
+	h.expect(errReply("ERR the append-only file is disabled on this server"), "BGREWRITEAOF")
 }

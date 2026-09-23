@@ -40,6 +40,11 @@ func run() error {
 	appendOnly := flag.Bool("appendonly", false, "log every write to an append-only file and replay it at startup")
 	appendFsync := flag.String("appendfsync", "everysec", "how often to force the log to disk: always, everysec or no")
 	appendFilename := flag.String("appendfilename", "appendonly.aof", "append-only file name")
+	rewritePercentage := flag.Int("auto-aof-rewrite-percentage", 100,
+		"rewrite the append-only file once it has grown this much since the last rewrite (0 disables it)")
+	rewriteMinSize := byteSize(64 << 20)
+	flag.Var(&rewriteMinSize, "auto-aof-rewrite-min-size",
+		"never rewrite the append-only file below this size")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -63,6 +68,7 @@ func run() error {
 	// Redis does it: mixing a snapshot with a log that covers a different
 	// stretch of time is a good way to resurrect deleted keys.
 	var saver *snapshot.Saver
+	var appendLog *aof.Log
 	var registryOpts []command.Option
 
 	if *useSnapshot {
@@ -85,7 +91,12 @@ func run() error {
 		if err := replayLog(db, path, logger); err != nil {
 			return err
 		}
-		appendLog, err := aof.Open(path, policy)
+		appendLog, err = aof.OpenWithOptions(path, aof.Options{
+			Policy:            policy,
+			RewritePercentage: *rewritePercentage,
+			RewriteMinSize:    int64(rewriteMinSize),
+			Logger:            logger,
+		})
 		if err != nil {
 			return err
 		}
@@ -96,7 +107,9 @@ func run() error {
 				logger.Error("could not close the append-only file", "err", err)
 			}
 		}()
-		logger.Info("append-only file is on", "path", path, "appendfsync", policy)
+		logger.Info("append-only file is on",
+			"path", path, "appendfsync", policy,
+			"auto-rewrite-percentage", *rewritePercentage, "auto-rewrite-min-size", rewriteMinSize)
 		registryOpts = append(registryOpts, command.WithAppendOnly(appendLog))
 	}
 
@@ -113,7 +126,16 @@ func run() error {
 		db.RunActiveExpiry(ctx)
 	}()
 
-	srv := server.New(command.NewRegistry(db, registryOpts...), logger)
+	registry := command.NewRegistry(db, registryOpts...)
+	if appendLog != nil {
+		// A rewrite copies the keyspace through the command table rather
+		// than straight from the store. Only the command table can take
+		// that copy at a moment when no command sits between changing the
+		// keyspace and being written to the log.
+		appendLog.SetExport(registry.ExportForRewrite)
+	}
+
+	srv := server.New(registry, logger)
 	serveErr := srv.Serve(ctx, ln)
 
 	// Serve can also return because accepting failed, with ctx still live.

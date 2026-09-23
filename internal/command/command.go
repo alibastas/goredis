@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alibastas/goredis/internal/resp"
@@ -63,6 +64,9 @@ type Registry struct {
 	db       *store.Store
 	// log is nil unless the server runs with an append-only file.
 	log AppendOnly
+	// writeLock puts write commands in a single order when there is a log.
+	// It is not taken at all without one. See runWrite.
+	writeLock sync.Mutex
 }
 
 // AppendOnly is the part of the append-only file the command table uses.
@@ -75,6 +79,9 @@ type AppendOnly interface {
 	// Flush hands the buffered commands to the operating system, and
 	// waits for the disk too if the configured policy says so.
 	Flush() error
+	// Rewrite replaces the log with the shortest series of commands that
+	// rebuilds the keyspace as it is now, in the background.
+	Rewrite() error
 }
 
 // Option configures a Registry. Options are Go's usual answer to a
@@ -107,7 +114,7 @@ func NewRegistry(db *store.Store, opts ...Option) *Registry {
 	}
 
 	r := &Registry{commands: make(map[string]*command), db: db, log: cfg.log}
-	h := &handlers{db: db, persister: cfg.persister}
+	h := &handlers{db: db, persister: cfg.persister, log: cfg.log}
 
 	// Connection
 	r.register("PING", -1, ping)
@@ -164,6 +171,7 @@ func NewRegistry(db *store.Store, opts ...Option) *Registry {
 	r.register("SAVE", 1, h.save)
 	r.register("BGSAVE", 1, h.bgsave)
 	r.register("LASTSAVE", 1, h.lastsave)
+	r.register("BGREWRITEAOF", 1, h.bgrewriteaof)
 	return r
 }
 
@@ -174,6 +182,8 @@ type handlers struct {
 	db *store.Store
 	// persister is nil when the server runs without persistence.
 	persister Persister
+	// log is nil when the server runs without an append-only file.
+	log AppendOnly
 }
 
 func (r *Registry) register(name string, arity int, h Handler) *command {
@@ -206,9 +216,51 @@ func (r *Registry) DispatchArgs(args []string) resp.Value {
 		return wrongArgCount(name)
 	}
 
+	if cmd.changesData && r.log != nil {
+		return r.runWrite(cmd, args)
+	}
+	return cmd.handler(args[1:])
+}
+
+// runWrite executes a command that changes data and records it in the
+// append-only file, with both halves under one lock.
+//
+// The lock is what makes the log a faithful account of the keyspace, and
+// it is only taken when there is a log to write to. Without it the two
+// halves are ordered independently: the keyspace orders them by its shard
+// locks and the log by its own, so two clients pushing to the same list at
+// the same time can be applied in one order and written down in the other.
+// Nothing is lost that way, but a restart would quietly reorder the list,
+// and a command whose effect a rewrite's copy already holds could be
+// written to the new log as well and counted twice.
+//
+// The cost is real: write commands no longer run in parallel with each
+// other while the log is on, which measures at 1.3x to 1.7x depending on
+// pipelining. Reads never take this lock and are unaffected, and a server
+// without a log never takes it at all. The README has the numbers.
+func (r *Registry) runWrite(cmd *command, args []string) resp.Value {
+	r.writeLock.Lock()
+	defer r.writeLock.Unlock()
+
 	reply := cmd.handler(args[1:])
 	r.appendToLog(cmd, args, reply)
 	return reply
+}
+
+// ExportForRewrite copies the keyspace for a log rewrite and calls buffer
+// once it has the copy, while still holding the write lock.
+//
+// Taking that lock is what puts the copy at a definite point in the log:
+// every write command is either entirely before it, and so already
+// written down, or entirely after it, and so in the rewrite's buffer.
+// Nothing can be in both, and nothing can fall between them.
+func (r *Registry) ExportForRewrite(buffer func()) []store.Record {
+	r.writeLock.Lock()
+	defer r.writeLock.Unlock()
+
+	records := r.db.Export()
+	buffer()
+	return records
 }
 
 // appendToLog records a command in the append-only file, after it ran.

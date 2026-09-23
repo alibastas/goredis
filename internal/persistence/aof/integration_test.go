@@ -1,13 +1,16 @@
 package aof_test
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -209,5 +212,75 @@ func writeFile(t *testing.T, path string, content []byte) {
 	t.Helper()
 	if err := os.WriteFile(path, content, 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestRewriteKeepsEveryCommandsEffect is the strongest thing this package
+// can check about a rewrite, and it needs a real keyspace to do it: after
+// commands have run against a store while a rewrite happens underneath
+// them, replaying the resulting log into an empty store has to produce
+// exactly the same keyspace.
+//
+// It catches both ways a rewrite can go wrong. A command that ends up in
+// neither the copy nor the new file is missing afterwards. A command whose
+// effect is already in the copy and which is written to the new file as
+// well is applied twice, which no amount of SETs would reveal, so the
+// commands here are INCRs and pushes, where doing something twice shows.
+//
+// Both depend on an interleaving, so this is a test that has to be run to
+// be believed: with the write lock removed it fails every time, and with
+// only the copy taken outside that lock it fails in about one run in four.
+func TestRewriteKeepsEveryCommandsEffect(t *testing.T) {
+	c := &clock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+
+	log, err := aof.OpenWithOptions(path, aof.Options{Policy: aof.FsyncNever, Logger: discard()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := store.NewWithClock(c.Now)
+	r := command.NewRegistry(db, command.WithAppendOnly(log))
+	log.SetExport(r.ExportForRewrite)
+
+	const writers, each = 8, 150
+	var wg sync.WaitGroup
+	for w := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range each {
+				// INCR and RPUSH both count, so applying one twice changes
+				// the result in a way the comparison below will catch.
+				r.DispatchArgs([]string{"INCR", "counter"})
+				r.DispatchArgs([]string{"RPUSH", "log", strconv.Itoa(w)})
+				if err := r.Flush(); err != nil {
+					t.Error(err)
+					return
+				}
+				// Rewrites keep starting throughout the run, so the copy
+				// lands at many different points relative to the writes.
+				if i%37 == w {
+					if err := log.Rewrite(); err != nil && !errors.Is(err, aof.ErrRewriteInProgress) {
+						t.Error(err)
+						return
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	want := keyspace(t, db)
+	got := keyspace(t, replay(t, c, path))
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("replaying the rewritten log gives a different keyspace:\n got: %s\nwant: %s",
+			strings.Join(got, "\n      "), strings.Join(want, "\n      "))
+	}
+	if n, _, _ := db.Get("counter"); n != strconv.Itoa(writers*each) {
+		t.Fatalf("the live counter is %q, want %d: the test itself lost writes", n, writers*each)
 	}
 }

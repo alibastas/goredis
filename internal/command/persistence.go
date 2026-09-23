@@ -48,3 +48,13 @@ func (h *handlers) lastsave(args []string) resp.Value {
 	}
 	return resp.NewInteger(h.persister.LastSave().Unix())
 }
+
+func (h *handlers) bgrewriteaof(args []string) resp.Value {
+	if h.log == nil {
+		return resp.NewError("ERR the append-only file is disabled on this server")
+	}
+	if err := h.log.Rewrite(); err != nil {
+		return resp.NewError("ERR " + err.Error())
+	}
+	return resp.NewSimpleString("Background append only file rewriting started")
+}
