@@ -38,8 +38,11 @@ OK
 `goredis-cli GET greeting` runs a single command and exits. The official
 `redis-cli -p 6380` works as well.
 
-Data survives a restart. The keyspace is saved to a snapshot file on
-shutdown, on `SAVE` and on `BGSAVE`, and loaded again at startup:
+Data survives a restart. There are two ways to keep it, and they make
+different promises.
+
+A **snapshot** is a copy of the whole keyspace, written on shutdown, on
+`SAVE` and on `BGSAVE`, and loaded again at startup:
 
 ```
 127.0.0.1:6380> BGSAVE
@@ -54,10 +57,25 @@ Background saving started
 Expiry times are stored as absolute deadlines, so a key that had 60
 seconds left before a 19-second downtime comes back with 41, not 60.
 
+Everything written between two snapshots is lost in a crash. The
+**append-only file** closes that gap by logging every write as it happens
+and replaying the log at startup:
+
+```bash
+go run ./cmd/goredis -appendonly -appendfsync everysec
+```
+
+`-appendfsync` picks how much a crash may cost: `always` waits for the
+disk before answering the client, `everysec` risks the last second, `no`
+leaves it to the operating system. See
+[the design notes](#the-append-only-file-a-log-of-every-write) for what
+each one actually guarantees.
+
 Server flags: `-addr` sets the listen address, `-debug` enables
 per-connection logs, `-shards` sets the number of keyspace shards,
-`-dir` and `-dbfilename` say where the snapshot lives, and
-`-snapshot=false` turns persistence off entirely.
+`-dir` says where the data files live, `-dbfilename` and
+`-appendfilename` name them, `-snapshot=false` turns snapshots off and
+`-appendonly` turns the log on.
 Client flags: `-h` host, `-p` port.
 
 Measure a running server with the bundled load generator, a small
@@ -72,8 +90,8 @@ go run ./cmd/goredis-benchmark -c 50 -n 200000 -P 16 -t set,get,incr,lpush
 | Group      | Commands |
 |------------|----------|
 | Connection | `PING`, `ECHO` |
-| Strings    | `GET`, `SET [NX\|XX] [EX s\|PX ms\|KEEPTTL]`, `INCR`, `DECR`, `INCRBY`, `DECRBY` |
-| Keyspace   | `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `KEYS`, `TYPE`, `DBSIZE`, `FLUSHDB` |
+| Strings    | `GET`, `SET [NX\|XX] [EX s\|PX ms\|EXAT ts\|PXAT ms\|KEEPTTL]`, `INCR`, `DECR`, `INCRBY`, `DECRBY` |
+| Keyspace   | `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `KEYS`, `TYPE`, `DBSIZE`, `FLUSHDB` |
 | Hashes     | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN` |
 | Lists      | `LPUSH`, `RPUSH`, `LPOP [count]`, `RPOP [count]`, `LRANGE`, `LINDEX`, `LLEN` |
 | Sets       | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` |
@@ -99,7 +117,7 @@ go test ./internal/persistence/snapshot -run='^$' -fuzz=FuzzDecode   # fuzz the 
 - [x] **Phase 2b:** Hash, list and set data types
 - [x] **Phase 2c:** Active key expiry, sharded keyspace, benchmarks
 - [x] **Phase 3a:** Snapshots: `SAVE`, `BGSAVE`, crash-safe file replacement
-- [ ] **Phase 3b:** Append-only file with selectable fsync policies
+- [x] **Phase 3b:** Append-only file with selectable fsync policies
 - [ ] **Phase 3c:** AOF rewrite
 - [ ] **Phase 4:** Pub/Sub
 - [ ] **Phase 5:** Leader/follower replication
@@ -302,12 +320,165 @@ can't make the server reserve half a gigabyte.
 On Ctrl+C or SIGTERM the server closes the listener, closes every client
 connection and waits for all connection goroutines to return before
 exiting. Only then, with nothing else touching the keyspace, does it wait
-for any background save to finish and write a final snapshot.
+for any background save to finish and write a final snapshot, and flush
+and fsync the append-only file whatever policy it is running under. A
+clean shutdown is the one moment where losing buffered writes would be
+inexcusable, so `no` and `everysec` sync there too.
 
 ### RESP2 only
 
 RESP2 is what `redis-cli` and every client library support by default. RESP3
 adds richer types but no new ideas relevant to this project.
+
+### The append-only file: a log of every write
+
+A snapshot loses everything written since it was taken. The append-only
+file is the other half of the answer: every command that changed the
+keyspace is appended to a file as it happens, and replaying that file
+from the start rebuilds the keyspace. Nothing in it is ever overwritten,
+which is what makes it cheap to write and possible to repair.
+
+Commands are stored in RESP, the same encoding clients speak, so the file
+needs no format of its own and the existing parser reads it back. It is
+also readable with `head`, which is worth something when debugging:
+
+```
+*3\r\n$3\r\nSET\r\n$4\r\nisim\r\n$10\r\nali bastas\r\n
+```
+
+Only commands that change data are logged, and only after they ran,
+which means the file holds what the server actually accepted rather than
+what clients asked for. A write that was refused, say `LPUSH` on a
+string, never reaches it. A write that was skipped on purpose, such as
+`SET ... NX` on an existing key, is logged anyway: it replays to the same
+nothing, and letting the replay decide is simpler and safer than trying
+to judge here whether the keyspace really changed.
+
+### Timeouts are logged as deadlines, not durations
+
+`SET k v EX 60` cannot be logged as written. Replayed three days later it
+would give the key another minute of life, and a key that should have
+died long ago would come back on every restart. Every timeout is
+therefore rewritten to an absolute moment before it is logged, which is
+what Redis does too:
+
+```
+SET k v EX 60   ->  SET k v PXAT 1790110408000
+EXPIRE k 60     ->  PEXPIREAT k 1790110408000
+```
+
+That required implementing `EXPIREAT`, `PEXPIREAT` and `SET ... EXAT|PXAT`,
+which are Redis commands anyway. It also pays for itself twice: because
+deadlines are absolute, keys that expire during normal operation do not
+have to be logged at all. Redis writes an explicit `DEL` when a key
+expires; here the replay simply does not load a key whose deadline has
+passed.
+
+Deadlines beyond the year 9999 are refused, so every expiry the server
+accepts is one that fits in a snapshot and cannot overflow time
+arithmetic later.
+
+### fsync is the dial, and `write` is not `fsync`
+
+`write` returning successfully does not mean the data is on the disk. It
+means the kernel has a copy in its page cache and will get to it. The
+data lives in three places on its way to safety, and the `appendfsync`
+setting picks which one the server waits for:
+
+| Where the data is | Survives `kill -9` | Survives power loss |
+|---|---|---|
+| goredis's own buffer | no | no |
+| written, in the OS page cache | yes | no |
+| fsynced, on the disk | yes | yes |
+
+`always` fsyncs before the reply is sent, `everysec` fsyncs once a second
+in the background, `no` never fsyncs and lets the operating system
+decide.
+
+Buffered commands are handed to the operating system at the exact moment
+the server flushes replies to the client, which it already does when
+there is nothing left to read from the connection. That point does double
+duty: a client can never receive a reply for a write the kernel has not
+been told about, and a pipeline of sixteen commands costs one `write`
+rather than sixteen.
+
+### Group commit: fifty clients, one fsync
+
+Under `always` the first implementation was catastrophic. Each connection
+took the log's lock, fsynced, and released it, so fifty concurrent
+clients queued up and every one paid for all the ones ahead of it:
+
+| appendfsync | Throughput (SET, 50 clients, no pipelining) |
+|---|---|
+| off (no log)    | 229k req/s |
+| `no`            | 104k req/s |
+| `everysec`      |  89k req/s |
+| `always`, one fsync per client | **2.6k req/s** |
+| `always`, shared fsync | **16.5k req/s** |
+
+The fix is that an fsync is not per-caller. It flushes the whole file, so
+an fsync already in flight will cover every write made before it started.
+Callers therefore wait on *what has been synced* rather than on a turn to
+sync: a counter records how many writes have reached the operating system
+and how many of those an fsync has covered, whoever arrives first does
+the work while the rest wait on a `sync.Cond`, and they all wake up to
+find their write already on the disk. Databases call this group commit.
+It is six times faster here and gives away nothing: when `Flush` returns,
+an fsync that included that write has completed.
+
+The lock is released while the fsync runs, so other connections keep
+filling the buffer meanwhile. The counter is read before unlocking, which
+is what keeps the bookkeeping honest: an fsync only ever claims writes
+that were already handed to the kernel when it began.
+
+Numbers with pipelining, where the log costs relatively more because the
+network no longer dominates: 1071k without the log, 382k with
+`everysec`, 106k with `always`.
+
+### A broken last command is normal; a broken middle one is not
+
+Writing to a file is not atomic, so a crash can land in the middle of a
+command and leave a fragment at the end of the log. Startup treats that
+as expected: it replays everything complete, logs a warning, and
+truncates the file to the last command boundary so the next append does
+not glue itself onto half a command.
+
+Damage anywhere earlier is refused and the server does not start. The
+reason is the same as for a corrupt snapshot: a server that starts with a
+hole in its data will happily write that state back out as the truth.
+
+Finding the truncation point is the fiddly part. The parser reads ahead
+into a buffer, so the file offset is well past the last command that was
+actually consumed. The loader counts the bytes it pulls from the file and
+subtracts what is still sitting in the reader's buffer. A test replays a
+log long enough to fill that buffer many times to make sure the
+arithmetic holds.
+
+The log is also read with inline commands disabled. The normal parser
+accepts `PING\r\n` typed over telnet, which is a feature for clients and
+a liability for a file: it would turn a line of damage into a plausible
+command instead of reporting it.
+
+### The log replays through a command table with no log attached
+
+Replaying means running the commands again, which the command table
+already knows how to do. But the live table appends to the log, so
+replaying through it would write every command straight back into the
+file it came from. Startup therefore builds a second table over the same
+store with no log attached, and hands its `Replay` method to the loader.
+
+The loader does not import the command package at all. It takes a
+`func(args []string) error` instead, because the command package has to
+know about the log in order to append to it, and two packages importing
+each other is not allowed in Go.
+
+### One source of truth at startup
+
+With the log enabled it is the only thing loaded; the snapshot is
+ignored. Mixing the two means reasoning about which stretch of time each
+file covers, and getting it wrong resurrects deleted keys. Redis behaves
+the same way. `SAVE` and `BGSAVE` keep working either way, so a snapshot
+is still available as a compact backup.
 
 ### Writing a file a crash cannot catch halfway
 
