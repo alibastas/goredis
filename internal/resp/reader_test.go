@@ -112,3 +112,23 @@ func TestReadValuePipelined(t *testing.T) {
 		t.Errorf("after last value: error = %v, want io.EOF", err)
 	}
 }
+
+// TestWithoutInlineCommands covers the reader used for the append-only
+// file, where a line that is not RESP means the file is damaged rather
+// than that someone is typing commands over telnet.
+func TestWithoutInlineCommands(t *testing.T) {
+	strict := NewReader(strings.NewReader("PING\r\n"), WithoutInlineCommands())
+	if _, err := strict.ReadValue(); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("strict reader accepted an inline command: err = %v", err)
+	}
+
+	// Proper RESP still works, and so does the default reader.
+	strict = NewReader(strings.NewReader("*1\r\n$4\r\nPING\r\n"), WithoutInlineCommands())
+	v, err := strict.ReadValue()
+	if err != nil || len(v.Array) != 1 || v.Array[0].Str != "PING" {
+		t.Fatalf("strict reader on RESP = %+v, %v", v, err)
+	}
+	if _, err := NewReader(strings.NewReader("PING\r\n")).ReadValue(); err != nil {
+		t.Fatalf("default reader rejected an inline command: %v", err)
+	}
+}

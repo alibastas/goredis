@@ -23,11 +23,28 @@ const (
 
 // Reader decodes RESP values from a byte stream.
 type Reader struct {
-	rd *bufio.Reader
+	rd       *bufio.Reader
+	noInline bool
 }
 
-func NewReader(r io.Reader) *Reader {
-	return &Reader{rd: bufio.NewReader(r)}
+// ReaderOption changes how a Reader parses its input.
+type ReaderOption func(*Reader)
+
+// WithoutInlineCommands makes the reader reject the inline command
+// shorthand and insist on proper RESP. It is meant for streams the server
+// produced itself, such as the append-only file: inline parsing turns any
+// line of text into a command, so a damaged file would quietly replay as
+// nonsense instead of being reported.
+func WithoutInlineCommands() ReaderOption {
+	return func(r *Reader) { r.noInline = true }
+}
+
+func NewReader(r io.Reader, opts ...ReaderOption) *Reader {
+	rd := &Reader{rd: bufio.NewReader(r)}
+	for _, opt := range opts {
+		opt(rd)
+	}
+	return rd
 }
 
 // Buffered returns the number of bytes already read from the underlying
@@ -54,6 +71,9 @@ func (r *Reader) ReadValue() (Value, error) {
 		}
 		if isTypePrefix(prefix[0]) {
 			return r.readValue()
+		}
+		if r.noInline {
+			return Value{}, fmt.Errorf("%w: expected a RESP value, got %q", ErrProtocol, prefix[0])
 		}
 
 		v, err := r.readInline()
