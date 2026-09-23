@@ -243,3 +243,49 @@ func TestConcurrentIncrements(t *testing.T) {
 
 	mustGet(t, s, "counter", strconv.Itoa(goroutines*perGoroutine))
 }
+
+// TestExpireAt covers the absolute form of expiry, which is what the
+// append-only file and snapshots store.
+func TestExpireAt(t *testing.T) {
+	s, clock := newTestStore()
+	deadline := clock.now.Add(time.Hour)
+
+	if s.ExpireAt("missing", deadline) {
+		t.Error("ExpireAt on a missing key returned true")
+	}
+
+	s.Set("k", "v", SetOptions{})
+	if !s.ExpireAt("k", deadline) {
+		t.Fatal("ExpireAt on an existing key returned false")
+	}
+	if ttl, ok := s.TTL("k"); !ok || ttl != time.Hour {
+		t.Errorf("TTL = %v, %v; want 1h", ttl, ok)
+	}
+
+	// A deadline already in the past deletes the key.
+	if !s.ExpireAt("k", clock.now.Add(-time.Second)) {
+		t.Error("ExpireAt with a past deadline returned false")
+	}
+	mustBeMissing(t, s, "k")
+}
+
+// TestSetWithAbsoluteExpiry checks SetOptions.ExpiresAt, which the EXAT
+// and PXAT options and every replayed timeout go through.
+func TestSetWithAbsoluteExpiry(t *testing.T) {
+	s, clock := newTestStore()
+	deadline := clock.now.Add(30 * time.Minute)
+
+	s.Set("k", "v", SetOptions{ExpiresAt: deadline})
+	if ttl, ok := s.TTL("k"); !ok || ttl != 30*time.Minute {
+		t.Errorf("TTL = %v, %v; want 30m", ttl, ok)
+	}
+
+	// An absolute deadline wins over a relative one.
+	s.Set("k", "v", SetOptions{TTL: time.Hour, ExpiresAt: deadline})
+	if ttl, _ := s.TTL("k"); ttl != 30*time.Minute {
+		t.Errorf("TTL = %v, want the absolute deadline to win", ttl)
+	}
+
+	clock.Advance(31 * time.Minute)
+	mustBeMissing(t, s, "k")
+}

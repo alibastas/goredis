@@ -54,7 +54,7 @@ const (
 // parser's: a length read from a file is untrusted input, and a corrupt
 // or hostile one must not be able to make the server allocate wildly.
 const (
-	maxStringLen  = 512 << 20 // 512 MB, Redis's limit for one value
+	maxStringLen  = 512 << 20 // 512 MB, Redis limit for one value
 	maxCollection = 1 << 32   // elements in one list, set or hash
 )
 
@@ -239,6 +239,7 @@ func decodeRecord(d *decoder, kind store.Kind) (Record, error) {
 	return rec, nil
 }
 
-// maxExpiry caps the deadline a file may claim at roughly the year 10000,
-// which keeps a corrupt value from overflowing time arithmetic later.
-const maxExpiry = 253402300799000
+// maxExpiry caps the deadline a file may claim at the same point the
+// server refuses to set one, which keeps a corrupt value from overflowing
+// time arithmetic later.
+const maxExpiry = store.MaxExpiryMillis

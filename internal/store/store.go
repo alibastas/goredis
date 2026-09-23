@@ -191,6 +191,10 @@ type SetOptions struct {
 	Condition SetCondition
 	// TTL makes the key expire after this long. Zero means no expiry.
 	TTL time.Duration
+	// ExpiresAt makes the key expire at a fixed moment, which is what the
+	// EXAT and PXAT options ask for. It wins over TTL. The zero Time means
+	// it is not in use.
+	ExpiresAt time.Time
 	// KeepTTL keeps the expiry of the existing key instead of clearing it.
 	KeepTTL bool
 }
@@ -211,6 +215,8 @@ func (s *Store) Set(key, val string, opts SetOptions) bool {
 
 	e := entry{value: stringValue(val)}
 	switch {
+	case !opts.ExpiresAt.IsZero():
+		e.expiresAt = opts.ExpiresAt
 	case opts.TTL > 0:
 		e.expiresAt = now.Add(opts.TTL)
 	case opts.KeepTTL:
@@ -289,10 +295,23 @@ func (s *Store) IncrBy(key string, delta int64) (int64, error) {
 	return current, nil
 }
 
+// Now reports the current time as the store sees it. Callers that have to
+// agree with the store on what "now" is, such as the append-only file
+// turning a relative timeout into an absolute one, ask for it here rather
+// than calling time.Now, so a test clock applies to them too.
+func (s *Store) Now() time.Time { return s.now() }
+
 // Expire sets key to expire after ttl. A ttl of zero or less deletes the
 // key right away, which is what Redis does too. It returns false if the key
 // does not exist.
 func (s *Store) Expire(key string, ttl time.Duration) bool {
+	return s.ExpireAt(key, s.now().Add(ttl))
+}
+
+// ExpireAt sets key to expire at a fixed moment, which is what EXPIREAT
+// and PEXPIREAT ask for. A deadline that has already passed deletes the
+// key right away. It returns false if the key does not exist.
+func (s *Store) ExpireAt(key string, deadline time.Time) bool {
 	sh := s.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -302,11 +321,11 @@ func (s *Store) Expire(key string, ttl time.Duration) bool {
 	if !ok {
 		return false
 	}
-	if ttl <= 0 {
+	if !now.Before(deadline) {
 		sh.remove(key)
 		return true
 	}
-	e.expiresAt = now.Add(ttl)
+	e.expiresAt = deadline
 	sh.put(key, e)
 	return true
 }
@@ -386,3 +405,9 @@ func (s *Store) Flush() {
 		sh.reset()
 	}
 }
+
+// MaxExpiryMillis is the furthest ahead a key may be told to expire, in
+// Unix milliseconds: the end of the year 9999. The limit exists so that
+// every deadline the server accepts is one it can also write to a
+// snapshot and read back, and so that arithmetic on it cannot overflow.
+const MaxExpiryMillis = 253402300799000
