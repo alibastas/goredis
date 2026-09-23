@@ -95,7 +95,7 @@ go run ./cmd/goredis-benchmark -c 50 -n 200000 -P 16 -t set,get,incr,lpush
 | Hashes     | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN` |
 | Lists      | `LPUSH`, `RPUSH`, `LPOP [count]`, `RPOP [count]`, `LRANGE`, `LINDEX`, `LLEN` |
 | Sets       | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` |
-| Persistence| `SAVE`, `BGSAVE`, `LASTSAVE` |
+| Persistence| `SAVE`, `BGSAVE`, `LASTSAVE`, `BGREWRITEAOF` |
 
 Replies and error messages match Redis, so existing clients behave the
 same way against goredis.
@@ -118,7 +118,7 @@ go test ./internal/persistence/snapshot -run='^$' -fuzz=FuzzDecode   # fuzz the 
 - [x] **Phase 2c:** Active key expiry, sharded keyspace, benchmarks
 - [x] **Phase 3a:** Snapshots: `SAVE`, `BGSAVE`, crash-safe file replacement
 - [x] **Phase 3b:** Append-only file with selectable fsync policies
-- [ ] **Phase 3c:** AOF rewrite
+- [x] **Phase 3c:** AOF rewrite, manual and automatic
 - [ ] **Phase 4:** Pub/Sub
 - [ ] **Phase 5:** Leader/follower replication
 - [ ] **Phase 6:** Leader election and automatic failover with Raft
@@ -402,19 +402,27 @@ duty: a client can never receive a reply for a write the kernel has not
 been told about, and a pipeline of sixteen commands costs one `write`
 rather than sixteen.
 
+What the dial costs, on this machine, in interleaved runs:
+
+| appendfsync  | Throughput (SET, 50 clients, no pipelining) |
+|--------------|--------------------------------------------:|
+| off, no log  | 109k req/s |
+| `no`         |  46k req/s |
+| `everysec`   |  16k req/s |
+| `always`     |   5k req/s |
+
+A warning about those numbers, and about every other measurement here:
+they come from a Windows laptop whose absolute throughput varies by more
+than a factor of two between sessions, depending on what else the machine
+is doing. Only comparisons made in one sitting, with the two versions run
+alternately, say anything at all. Each table below is one such sitting;
+numbers from different tables should not be divided by each other.
+
 ### Group commit: fifty clients, one fsync
 
 Under `always` the first implementation was catastrophic. Each connection
 took the log's lock, fsynced, and released it, so fifty concurrent
-clients queued up and every one paid for all the ones ahead of it:
-
-| appendfsync | Throughput (SET, 50 clients, no pipelining) |
-|---|---|
-| off (no log)    | 229k req/s |
-| `no`            | 104k req/s |
-| `everysec`      |  89k req/s |
-| `always`, one fsync per client | **2.6k req/s** |
-| `always`, shared fsync | **16.5k req/s** |
+clients queued up and every one paid for all the ones ahead of it.
 
 The fix is that an fsync is not per-caller. It flushes the whole file, so
 an fsync already in flight will cover every write made before it started.
@@ -423,17 +431,98 @@ sync: a counter records how many writes have reached the operating system
 and how many of those an fsync has covered, whoever arrives first does
 the work while the rest wait on a `sync.Cond`, and they all wake up to
 find their write already on the disk. Databases call this group commit.
-It is six times faster here and gives away nothing: when `Flush` returns,
-an fsync that included that write has completed.
+
+| `always`, 50 clients, no pipelining | Throughput  |
+|-------------------------------------|------------:|
+| One fsync per caller                | 1.9k req/s  |
+| One fsync shared                    | 7.0k req/s  |
+
+Three and a half times faster, and it gives away nothing: when `Flush`
+returns, an fsync that included that write has completed.
 
 The lock is released while the fsync runs, so other connections keep
 filling the buffer meanwhile. The counter is read before unlocking, which
 is what keeps the bookkeeping honest: an fsync only ever claims writes
 that were already handed to the kernel when it began.
 
-Numbers with pipelining, where the log costs relatively more because the
-network no longer dominates: 1071k without the log, 382k with
-`everysec`, 106k with `always`.
+### Rewriting the log: from a history to a recipe
+
+The log only ever grows, and it grows with the number of writes rather
+than the amount of data. Ten million increments of one counter are ten
+million lines on disk describing a single number. A rewrite replaces the
+file with the shortest series of commands that rebuilds the keyspace as
+it is now: one `SET`, `RPUSH`, `SADD` or `HSET` per key, plus a
+`PEXPIREAT` for keys that expire.
+
+Measured on a log of 205,000 commands against 3,123 keys, one of them a
+counter that was incremented 200,000 times:
+
+|                        | Before    | After    |
+|------------------------|-----------|----------|
+| Commands in the file   | 205,000   | 3,123    |
+| File size              | 5.7 MB    | 109 KB   |
+| Replay time at startup | 323 ms    | 12 ms    |
+
+That is 53x smaller and 27x faster to load, and the rewrite itself took
+36 ms. It runs on `BGREWRITEAOF`, and automatically once the file has
+doubled since the last rewrite and is at least 64 MB
+(`-auto-aof-rewrite-percentage`, `-auto-aof-rewrite-min-size`). The
+second condition matters: without it a small file would be rewritten
+constantly, and doubling a small file says nothing about how much of it
+is redundant.
+
+Collections are split across several commands, at most 64 elements each,
+the way Redis does it. A single `RPUSH` with a million arguments would be
+past what the RESP parser accepts, so without splitting a rewrite could
+produce a log the server refuses to read back.
+
+### Rewriting while the server keeps writing
+
+A rewrite takes a copy of the keyspace, and by the time the new file is
+written that copy is out of date. Commands that arrive in between belong
+in the new file too, so from the moment the copy is taken every write
+goes into two places: the file that is about to be replaced, so a crash
+before the swap loses nothing, and a buffer that is appended to the new
+file just before it takes over. The swap itself is the same temp file,
+fsync and rename as a snapshot, so a failed rewrite leaves the old log in
+place and working.
+
+The interesting part is what "the moment the copy is taken" has to mean.
+A command changes the keyspace first and is written to the log second, and
+those are two steps. A copy taken between them would already hold the
+command's effect while the new log received the command as well, and the
+next replay would apply it twice: invisible for `SET`, wrong for `INCR`.
+Taken the other way round, the copy and the buffer could both miss a
+command and lose it.
+
+Both halves therefore run under one lock, and the copy is taken while
+holding it. Every write command is then either entirely before the copy,
+and so already in the log, or entirely after it, and so in the buffer.
+
+The same lock buys a second guarantee. Without it, the keyspace orders
+concurrent writes by its shard locks while the log orders them by its
+own, so two clients pushing to the same list could be applied in one
+order and written down in the other. Nothing is lost, but a restart would
+quietly reorder the list. Redis has neither problem because it runs
+commands one at a time; this is the price of not doing that.
+
+It is a real price. Interleaved runs, `everysec`, 50 clients, SET:
+
+| Write path                     | No pipelining | Pipeline 16 |
+|--------------------------------|--------------:|------------:|
+| Writes run in parallel         | 29k req/s     | 169k req/s  |
+| Writes serialised (this build) | 16k req/s     | 126k req/s  |
+
+So roughly 1.3x to 1.7x on writes, and only when the log is enabled:
+without it the lock is never taken. Reads never take it and are
+unaffected. A correct log is worth more than the difference, and the
+number to compare against is Redis, which serialises everything.
+
+The test that justifies all of this runs real commands through the real
+command table while rewrites happen underneath them, then replays the
+resulting log into an empty keyspace and compares the two. With the lock
+removed it fails every time; with only the copy taken outside it, about
+one run in four.
 
 ### A broken last command is normal; a broken middle one is not
 
