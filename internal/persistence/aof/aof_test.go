@@ -6,10 +6,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func discardLogger() *slog.Logger {
@@ -162,6 +164,55 @@ func fileSize(t *testing.T, path string) int64 {
 		t.Fatal(err)
 	}
 	return info.Size()
+}
+
+// TestGroupCommit is the reason syncLocked is written the way it is. Under
+// the always policy every connection wants its write on the disk before it
+// answers, but one fsync covers the whole file, so a crowd of them should
+// cost far fewer than one fsync each.
+func TestGroupCommit(t *testing.T) {
+	l, path := openTestLog(t, FsyncAlways)
+
+	var syncs atomic.Int64
+	l.sync = func() error {
+		syncs.Add(1)
+		// Stand in for a slow disk, so the goroutines really do pile up.
+		time.Sleep(2 * time.Millisecond)
+		return nil
+	}
+
+	const writers = 40
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for w := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // let them all arrive together
+			l.Append([]string{"SET", "k" + strconv.Itoa(w), "v"})
+			if err := l.Flush(); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := syncs.Load(); got >= writers {
+		t.Errorf("%d fsyncs for %d concurrent flushes: they were not shared", got, writers)
+	}
+	if got := syncs.Load(); got == 0 {
+		t.Error("no fsync happened at all under the always policy")
+	}
+
+	// Sharing must not cost durability: every command is still in the file.
+	l.sync = func() error { return nil }
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readBack(t, path); len(got) != writers {
+		t.Fatalf("the log holds %d commands, want %d", len(got), writers)
+	}
 }
 
 // TestAlwaysSyncsBeforeFlushReturns states the guarantee the always policy

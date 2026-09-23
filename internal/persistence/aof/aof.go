@@ -97,10 +97,15 @@ type Log struct {
 	policy FsyncPolicy
 	err    error
 	// buffered means Append has written something the operating system has
-	// not been handed yet; pending means the operating system has it but
-	// the disk may not.
+	// not been handed yet.
 	buffered bool
-	pending  bool
+	// written counts the writes that have reached the operating system and
+	// synced counts how many of those an fsync has covered, which is what
+	// lets several callers share one fsync. See syncLocked.
+	written uint64
+	synced  uint64
+	syncing bool
+	cond    *sync.Cond
 	// sync forces the file to the disk. It is a field so tests can count
 	// the calls and make them slow on purpose.
 	sync func() error
@@ -122,6 +127,7 @@ func Open(path string, policy FsyncPolicy) (*Log, error) {
 		stop:   make(chan struct{}),
 		done:   make(chan struct{}),
 	}
+	l.cond = sync.NewCond(&l.mu)
 	l.sync = f.Sync
 
 	if policy == FsyncEverySecond {
@@ -166,7 +172,7 @@ func (l *Log) flushLocked() error {
 			return err
 		}
 		l.buffered = false
-		l.pending = true
+		l.written++
 	}
 	if l.policy == FsyncAlways {
 		return l.syncLocked()
@@ -174,18 +180,46 @@ func (l *Log) flushLocked() error {
 	return nil
 }
 
-// syncLocked forces what has been written onto the disk. It must be called
-// with the lock held.
+// syncLocked forces everything written so far onto the disk, sharing one
+// fsync between everybody waiting for one. It must be called with the lock
+// held and returns with it held again.
+//
+// Without the sharing, the always policy serialises: fifty connections
+// that each want their own fsync queue up behind each other and every one
+// pays for all the ones ahead of it. But an fsync is not per-caller. It
+// flushes the whole file, so the one already running will cover writes
+// made before it started. Callers therefore look at what has been synced
+// rather than at who synced it: whoever gets there first does the work,
+// the rest wait and then find their write already on disk. Databases call
+// this group commit.
+//
+// The lock is released while fsync runs, which is the point: other
+// connections keep writing to the buffer meanwhile. The counter is read
+// before unlocking, so this fsync only ever claims writes that were
+// already handed to the operating system when it started.
 func (l *Log) syncLocked() error {
-	if l.err != nil || !l.pending {
-		return l.err
+	for l.err == nil && l.synced < l.written {
+		if l.syncing {
+			l.cond.Wait()
+			continue
+		}
+		l.syncing = true
+		target := l.written
+
+		l.mu.Unlock()
+		err := l.sync()
+		l.mu.Lock()
+
+		l.syncing = false
+		switch {
+		case err != nil:
+			l.err = err
+		case target > l.synced:
+			l.synced = target
+		}
+		l.cond.Broadcast()
 	}
-	if err := l.sync(); err != nil {
-		l.err = err
-		return err
-	}
-	l.pending = false
-	return nil
+	return l.err
 }
 
 // syncEverySecond is the background half of the everysec policy. Writes
@@ -216,6 +250,11 @@ func (l *Log) Close() error {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// An fsync started by someone else may still be running, and it is
+	// holding the file this is about to close.
+	for l.syncing {
+		l.cond.Wait()
+	}
 	l.flushLocked()
 	l.syncLocked()
 	if err := l.f.Close(); err != nil && l.err == nil {
