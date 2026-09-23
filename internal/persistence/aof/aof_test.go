@@ -25,6 +25,9 @@ func openTestLog(t *testing.T, policy FsyncPolicy) (*Log, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Windows will not delete the temporary directory while the file is
+	// still open, and Close is safe to call twice.
+	t.Cleanup(func() { l.Close() })
 	return l, path
 }
 
@@ -96,14 +99,14 @@ func TestAppendBuffersUntilFlush(t *testing.T) {
 	defer l.Close()
 
 	l.Append([]string{"SET", "k", "v"})
-	if size := fileSize(t, path); size != 0 {
+	if size := sizeOf(t, path); size != 0 {
 		t.Fatalf("file is %d bytes before Flush, want 0", size)
 	}
 
 	if err := l.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	if size := fileSize(t, path); size == 0 {
+	if size := sizeOf(t, path); size == 0 {
 		t.Fatal("file is still empty after Flush")
 	}
 	if got := readBack(t, path); len(got) != 1 || got[0][2] != "v" {
@@ -157,7 +160,7 @@ func TestLoadOfAMissingFile(t *testing.T) {
 	}
 }
 
-func fileSize(t *testing.T, path string) int64 {
+func sizeOf(t *testing.T, path string) int64 {
 	t.Helper()
 	info, err := os.Stat(path)
 	if err != nil {

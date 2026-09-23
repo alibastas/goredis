@@ -58,5 +58,5 @@ func WriteFileAtomic(path string, write func(io.Writer) error) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return err
 	}
-	return syncDir(dir)
+	return SyncDir(dir)
 }

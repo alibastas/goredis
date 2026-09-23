@@ -68,7 +68,7 @@ func TestLoadTruncatesAnIncompleteTail(t *testing.T) {
 			if len(got) != 2 {
 				t.Fatalf("replayed %d commands, want the 2 complete ones", len(got))
 			}
-			if size := fileSize(t, path); size != complete {
+			if size := sizeOf(t, path); size != complete {
 				t.Fatalf("file is %d bytes after loading, want it truncated to %d", size, complete)
 			}
 
@@ -107,7 +107,7 @@ func TestLoadRejectsDamageInTheMiddle(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := writeLog(t, tt.content)
-			before := fileSize(t, path)
+			before := sizeOf(t, path)
 
 			var applied int
 			_, err := Load(path, func([]string) error { applied++; return nil }, discardLogger())
@@ -117,7 +117,7 @@ func TestLoadRejectsDamageInTheMiddle(t *testing.T) {
 			if !errors.Is(err, ErrCorrupt) {
 				t.Fatalf("error %v does not wrap ErrCorrupt", err)
 			}
-			if size := fileSize(t, path); size != before {
+			if size := sizeOf(t, path); size != before {
 				t.Errorf("a rejected file was modified: %d bytes, was %d", size, before)
 			}
 		})
@@ -165,7 +165,7 @@ func TestLoadTracksTheOffsetPastTheBuffer(t *testing.T) {
 	if len(got) != commands {
 		t.Fatalf("replayed %d commands, want %d", len(got), commands)
 	}
-	if size := fileSize(t, path); size != complete {
+	if size := sizeOf(t, path); size != complete {
 		t.Fatalf("truncated to %d bytes, want %d", size, complete)
 	}
 }
