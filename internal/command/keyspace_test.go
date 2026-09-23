@@ -3,6 +3,7 @@ package command
 import (
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -85,4 +86,44 @@ func TestDBSizeAndFlushDB(t *testing.T) {
 	h.expect(integer(2), "DBSIZE")
 	h.expect(OK, "FLUSHDB")
 	h.expect(integer(0), "DBSIZE")
+}
+
+// TestExpireAt covers the absolute form of the timeout commands. They
+// exist because the append-only file stores every deadline this way: a
+// relative timeout written to a log would be measured again from whenever
+// the log is replayed.
+func TestExpireAt(t *testing.T) {
+	h := newHarness(t)
+	secs := func(d time.Duration) string {
+		return strconv.FormatInt(h.now.Add(d).Unix(), 10)
+	}
+	ms := func(d time.Duration) string {
+		return strconv.FormatInt(h.now.Add(d).UnixMilli(), 10)
+	}
+
+	h.expect(integer(0), "EXPIREAT", "k", secs(time.Hour))
+	h.expect(OK, "SET", "k", "v")
+
+	h.expect(integer(1), "EXPIREAT", "k", secs(time.Hour))
+	h.expect(integer(3600), "TTL", "k")
+
+	h.expect(integer(1), "PEXPIREAT", "k", ms(1500*time.Millisecond))
+	h.expect(integer(1500), "PTTL", "k")
+
+	// A deadline that has already passed deletes the key, like a negative
+	// timeout does.
+	h.expect(integer(1), "PEXPIREAT", "k", ms(-time.Second))
+	h.expect(integer(0), "EXISTS", "k")
+}
+
+func TestExpireAtErrors(t *testing.T) {
+	h := newHarness(t)
+	h.expect(OK, "SET", "k", "v")
+
+	h.expect(errReply("ERR value is not an integer or out of range"), "EXPIREAT", "k", "soon")
+	// Deadlines past the year 9999 are refused, so every expiry the server
+	// accepts is one a snapshot can carry.
+	h.expect(errReply("ERR invalid expire time in 'expireat' command"), "EXPIREAT", "k", "999999999999")
+	h.expect(errReply("ERR invalid expire time in 'pexpireat' command"), "PEXPIREAT", "k", "999999999999999")
+	h.expect(integer(-1), "TTL", "k")
 }

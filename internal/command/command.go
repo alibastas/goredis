@@ -80,6 +80,8 @@ func NewRegistry(db *store.Store, opts ...Option) *Registry {
 	r.register("EXISTS", -2, h.exists)
 	r.register("EXPIRE", 3, h.expire)
 	r.register("PEXPIRE", 3, h.pexpire)
+	r.register("EXPIREAT", 3, h.expireAt)
+	r.register("PEXPIREAT", 3, h.pexpireAt)
 	r.register("TTL", 2, h.ttl)
 	r.register("PTTL", 2, h.pttl)
 	r.register("PERSIST", 2, h.persist)

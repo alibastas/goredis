@@ -23,6 +23,14 @@ func (h *handlers) pexpire(args []string) resp.Value {
 	return h.setExpiry(args, time.Millisecond, "pexpire")
 }
 
+func (h *handlers) expireAt(args []string) resp.Value {
+	return h.setDeadline(args, time.Second, "expireat")
+}
+
+func (h *handlers) pexpireAt(args []string) resp.Value {
+	return h.setDeadline(args, time.Millisecond, "pexpireat")
+}
+
 // setExpiry implements EXPIRE and PEXPIRE. A zero or negative timeout is
 // valid and deletes the key immediately.
 func (h *handlers) setExpiry(args []string, unit time.Duration, cmd string) resp.Value {
@@ -35,6 +43,21 @@ func (h *handlers) setExpiry(args []string, unit time.Duration, cmd string) resp
 		return invalidExpireTime(cmd)
 	}
 	return boolReply(h.db.Expire(args[0], ttl))
+}
+
+// setDeadline implements EXPIREAT and PEXPIREAT, which give the moment a
+// key dies rather than how long it has left. A deadline in the past
+// deletes the key, exactly like a negative timeout.
+func (h *handlers) setDeadline(args []string, unit time.Duration, cmd string) resp.Value {
+	n, isInt := parseInt(args[1])
+	if !isInt {
+		return notAnInteger
+	}
+	deadline, valid := unixTime(n, unit)
+	if !valid {
+		return invalidExpireTime(cmd)
+	}
+	return boolReply(h.db.ExpireAt(args[0], deadline))
 }
 
 func (h *handlers) ttl(args []string) resp.Value  { return h.remainingTTL(args[0], time.Second) }

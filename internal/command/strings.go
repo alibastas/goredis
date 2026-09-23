@@ -37,12 +37,12 @@ func (h *handlers) set(args []string) resp.Value {
 				opts.Condition = store.IfExists
 			}
 		case "KEEPTTL":
-			if opts.KeepTTL || opts.TTL != 0 {
+			if opts.KeepTTL || opts.TTL != 0 || !opts.ExpiresAt.IsZero() {
 				return syntaxError
 			}
 			opts.KeepTTL = true
 		case "EX", "PX":
-			if opts.KeepTTL || opts.TTL != 0 || i+1 == len(args) {
+			if opts.KeepTTL || opts.TTL != 0 || !opts.ExpiresAt.IsZero() || i+1 == len(args) {
 				return syntaxError
 			}
 			i++
@@ -59,6 +59,27 @@ func (h *handlers) set(args []string) resp.Value {
 				return invalidExpireTime("set")
 			}
 			opts.TTL = ttl
+		case "EXAT", "PXAT":
+			// The absolute form of EX and PX. The append-only file logs
+			// every timeout this way, so a replay cannot hand a key its
+			// full lifetime all over again.
+			if opts.KeepTTL || opts.TTL != 0 || !opts.ExpiresAt.IsZero() || i+1 == len(args) {
+				return syntaxError
+			}
+			i++
+			n, isInt := parseInt(args[i])
+			if !isInt {
+				return notAnInteger
+			}
+			unit := time.Second
+			if opt == "PXAT" {
+				unit = time.Millisecond
+			}
+			deadline, valid := unixTime(n, unit)
+			if !valid {
+				return invalidExpireTime("set")
+			}
+			opts.ExpiresAt = deadline
 		default:
 			return syntaxError
 		}
@@ -116,4 +137,21 @@ func toDuration(n int64, unit time.Duration) (time.Duration, bool) {
 		return 0, false
 	}
 	return time.Duration(n) * unit, true
+}
+
+// unixTime turns n units since the epoch into a moment. Deadlines beyond
+// what a snapshot can carry are rejected, so a key can never be given an
+// expiry the server would fail to write back out.
+func unixTime(n int64, unit time.Duration) (time.Time, bool) {
+	ms := n
+	if unit == time.Second {
+		if n > store.MaxExpiryMillis/1000 || n < -store.MaxExpiryMillis/1000 {
+			return time.Time{}, false
+		}
+		ms = n * 1000
+	}
+	if ms > store.MaxExpiryMillis {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(ms), true
 }
