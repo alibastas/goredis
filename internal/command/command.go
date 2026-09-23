@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/alibastas/goredis/internal/resp"
 	"github.com/alibastas/goredis/internal/store"
@@ -22,6 +23,30 @@ type command struct {
 	// a positive value means exactly that many and a negative value means
 	// at least -arity. PING has arity -1, ECHO has arity 2.
 	arity int
+	// changesData marks the commands that modify the keyspace. Only those
+	// are written to the append-only file; replaying a GET would be a
+	// waste of space and time.
+	changesData bool
+	// rewrite turns a command into the form that should be logged instead
+	// of the one the client sent, and may return nil to log nothing. It
+	// exists because a relative timeout is only meaningful at the moment
+	// it is given: a log full of "expire in 60 seconds" would hand every
+	// key another minute of life on every replay.
+	rewrite func(args []string, now time.Time) []string
+}
+
+// write marks a command as one that changes the keyspace.
+func (c *command) write() *command {
+	c.changesData = true
+	return c
+}
+
+// writeAs marks a command as a write and gives it a different shape in
+// the log.
+func (c *command) writeAs(rewrite func(args []string, now time.Time) []string) *command {
+	c.changesData = true
+	c.rewrite = rewrite
+	return c
 }
 
 func (c command) acceptsArgCount(n int) bool {
@@ -34,7 +59,22 @@ func (c command) acceptsArgCount(n int) bool {
 // Registry holds every command the server understands, keyed by its
 // upper-case name.
 type Registry struct {
-	commands map[string]command
+	commands map[string]*command
+	db       *store.Store
+	// log is nil unless the server runs with an append-only file.
+	log AppendOnly
+}
+
+// AppendOnly is the part of the append-only file the command table uses.
+// As with Persister, the interface lives here so the dependency runs from
+// the command package to the persistence one and not back again.
+type AppendOnly interface {
+	// Append records a command that changed the keyspace. It buffers, so
+	// nothing reaches the operating system until Flush.
+	Append(args []string)
+	// Flush hands the buffered commands to the operating system, and
+	// waits for the disk too if the configured policy says so.
+	Flush() error
 }
 
 // Option configures a Registry. Options are Go's usual answer to a
@@ -45,12 +85,18 @@ type Option func(*options)
 
 type options struct {
 	persister Persister
+	log       AppendOnly
 }
 
 // WithPersistence enables the SAVE, BGSAVE and LASTSAVE commands. Without
 // it they report that persistence is disabled.
 func WithPersistence(p Persister) Option {
 	return func(o *options) { o.persister = p }
+}
+
+// WithAppendOnly logs every command that changes the keyspace to l.
+func WithAppendOnly(l AppendOnly) Option {
+	return func(o *options) { o.log = l }
 }
 
 // NewRegistry creates a registry whose data commands operate on db.
@@ -60,7 +106,7 @@ func NewRegistry(db *store.Store, opts ...Option) *Registry {
 		opt(&cfg)
 	}
 
-	r := &Registry{commands: make(map[string]command)}
+	r := &Registry{commands: make(map[string]*command), db: db, log: cfg.log}
 	h := &handlers{db: db, persister: cfg.persister}
 
 	// Connection
@@ -69,47 +115,47 @@ func NewRegistry(db *store.Store, opts ...Option) *Registry {
 
 	// Strings
 	r.register("GET", 2, h.get)
-	r.register("SET", -3, h.set)
-	r.register("INCR", 2, h.incr)
-	r.register("DECR", 2, h.decr)
-	r.register("INCRBY", 3, h.incrBy)
-	r.register("DECRBY", 3, h.decrBy)
+	r.register("SET", -3, h.set).writeAs(rewriteSet)
+	r.register("INCR", 2, h.incr).write()
+	r.register("DECR", 2, h.decr).write()
+	r.register("INCRBY", 3, h.incrBy).write()
+	r.register("DECRBY", 3, h.decrBy).write()
 
 	// Keyspace
-	r.register("DEL", -2, h.del)
+	r.register("DEL", -2, h.del).write()
 	r.register("EXISTS", -2, h.exists)
-	r.register("EXPIRE", 3, h.expire)
-	r.register("PEXPIRE", 3, h.pexpire)
-	r.register("EXPIREAT", 3, h.expireAt)
-	r.register("PEXPIREAT", 3, h.pexpireAt)
+	r.register("EXPIRE", 3, h.expire).writeAs(rewriteExpire(time.Second))
+	r.register("PEXPIRE", 3, h.pexpire).writeAs(rewriteExpire(time.Millisecond))
+	r.register("EXPIREAT", 3, h.expireAt).writeAs(rewriteExpireAt(time.Second))
+	r.register("PEXPIREAT", 3, h.pexpireAt).writeAs(rewriteExpireAt(time.Millisecond))
 	r.register("TTL", 2, h.ttl)
 	r.register("PTTL", 2, h.pttl)
-	r.register("PERSIST", 2, h.persist)
+	r.register("PERSIST", 2, h.persist).write()
 	r.register("KEYS", 2, h.keys)
 	r.register("DBSIZE", 1, h.dbsize)
-	r.register("FLUSHDB", 1, h.flushdb)
+	r.register("FLUSHDB", 1, h.flushdb).write()
 	r.register("TYPE", 2, h.typeOf)
 
 	// Hashes
-	r.register("HSET", -4, h.hset)
+	r.register("HSET", -4, h.hset).write()
 	r.register("HGET", 3, h.hget)
-	r.register("HDEL", -3, h.hdel)
+	r.register("HDEL", -3, h.hdel).write()
 	r.register("HGETALL", 2, h.hgetall)
 	r.register("HEXISTS", 3, h.hexists)
 	r.register("HLEN", 2, h.hlen)
 
 	// Lists
-	r.register("LPUSH", -3, h.lpush)
-	r.register("RPUSH", -3, h.rpush)
-	r.register("LPOP", -2, h.lpop)
-	r.register("RPOP", -2, h.rpop)
+	r.register("LPUSH", -3, h.lpush).write()
+	r.register("RPUSH", -3, h.rpush).write()
+	r.register("LPOP", -2, h.lpop).write()
+	r.register("RPOP", -2, h.rpop).write()
 	r.register("LRANGE", 4, h.lrange)
 	r.register("LINDEX", 3, h.lindex)
 	r.register("LLEN", 2, h.llen)
 
 	// Sets
-	r.register("SADD", -3, h.sadd)
-	r.register("SREM", -3, h.srem)
+	r.register("SADD", -3, h.sadd).write()
+	r.register("SREM", -3, h.srem).write()
 	r.register("SMEMBERS", 2, h.smembers)
 	r.register("SISMEMBER", 3, h.sismember)
 	r.register("SCARD", 2, h.scard)
@@ -130,8 +176,10 @@ type handlers struct {
 	persister Persister
 }
 
-func (r *Registry) register(name string, arity int, h Handler) {
-	r.commands[name] = command{handler: h, arity: arity}
+func (r *Registry) register(name string, arity int, h Handler) *command {
+	c := &command{handler: h, arity: arity}
+	r.commands[name] = c
+	return c
 }
 
 // Dispatch runs the command described by req and returns its reply.
@@ -143,7 +191,12 @@ func (r *Registry) Dispatch(req resp.Value) resp.Value {
 	if err != nil {
 		return resp.NewError("ERR " + err.Error())
 	}
+	return r.DispatchArgs(args)
+}
 
+// DispatchArgs is Dispatch for a command that is already split into its
+// arguments, which is the shape the append-only file replays them in.
+func (r *Registry) DispatchArgs(args []string) resp.Value {
 	name := strings.ToUpper(args[0])
 	cmd, ok := r.commands[name]
 	if !ok {
@@ -152,7 +205,52 @@ func (r *Registry) Dispatch(req resp.Value) resp.Value {
 	if !cmd.acceptsArgCount(len(args)) {
 		return wrongArgCount(name)
 	}
-	return cmd.handler(args[1:])
+
+	reply := cmd.handler(args[1:])
+	r.appendToLog(cmd, args, reply)
+	return reply
+}
+
+// appendToLog records a command in the append-only file, after it ran.
+//
+// Logging afterwards, and only when the reply is not an error, means the
+// log holds commands that the server actually accepted. A write that was
+// skipped on purpose, such as a SET NX on a key that already exists, is
+// still logged: it replays to the same nothing, and leaving the decision
+// to the replay is simpler than trying to guess here whether the
+// keyspace really changed.
+func (r *Registry) appendToLog(cmd *command, args []string, reply resp.Value) {
+	if r.log == nil || !cmd.changesData || reply.Type == resp.Error {
+		return
+	}
+	logged := args
+	if cmd.rewrite != nil {
+		logged = cmd.rewrite(args, r.db.Now())
+	}
+	if logged != nil {
+		r.log.Append(logged)
+	}
+}
+
+// Flush pushes everything the commands have written to the append-only
+// file out to the operating system. The server calls it once a batch of
+// pipelined commands is done, right before it sends the replies, so no
+// client ever sees a reply for a write the log has not been told about.
+func (r *Registry) Flush() error {
+	if r.log == nil {
+		return nil
+	}
+	return r.log.Flush()
+}
+
+// Replay applies one command read back from the append-only file. An
+// error reply means the log does not match this server, which is worth
+// stopping for rather than starting up with part of the data.
+func (r *Registry) Replay(args []string) error {
+	if reply := r.DispatchArgs(args); reply.Type == resp.Error {
+		return errors.New(reply.Str)
+	}
+	return nil
 }
 
 // requestArgs checks that req has the shape clients use for commands, a

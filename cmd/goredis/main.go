@@ -12,8 +12,10 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/alibastas/goredis/internal/command"
+	"github.com/alibastas/goredis/internal/persistence/aof"
 	"github.com/alibastas/goredis/internal/persistence/snapshot"
 	"github.com/alibastas/goredis/internal/server"
 	"github.com/alibastas/goredis/internal/store"
@@ -35,6 +37,9 @@ func run() error {
 	dir := flag.String("dir", ".", "directory holding the data files")
 	dbfilename := flag.String("dbfilename", "dump.goredis", "snapshot file name")
 	useSnapshot := flag.Bool("snapshot", true, "load a snapshot at startup and write one on shutdown")
+	appendOnly := flag.Bool("appendonly", false, "log every write to an append-only file and replay it at startup")
+	appendFsync := flag.String("appendfsync", "everysec", "how often to force the log to disk: always, everysec or no")
+	appendFilename := flag.String("appendfilename", "appendonly.aof", "append-only file name")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -48,17 +53,51 @@ func run() error {
 	defer stop()
 
 	db := store.NewWithOptions(store.Options{Shards: *shards})
+	if err := os.MkdirAll(*dir, 0o755); err != nil {
+		return err
+	}
 
-	// Load the previous snapshot before accepting anyone, so no client can
-	// see an empty keyspace that is about to fill up.
+	// Whatever was saved last time is loaded before anyone is let in, so no
+	// client can see an empty keyspace that is about to fill up. With the
+	// append-only file enabled it is the only source of truth, the way
+	// Redis does it: mixing a snapshot with a log that covers a different
+	// stretch of time is a good way to resurrect deleted keys.
 	var saver *snapshot.Saver
 	var registryOpts []command.Option
+
 	if *useSnapshot {
-		var err error
-		if saver, err = openSnapshot(db, *dir, *dbfilename, logger); err != nil {
+		path := filepath.Join(*dir, *dbfilename)
+		if !*appendOnly {
+			if err := loadSnapshot(db, path, logger); err != nil {
+				return err
+			}
+		}
+		saver = snapshot.NewSaver(db, path, logger)
+		registryOpts = append(registryOpts, command.WithPersistence(saver))
+	}
+
+	if *appendOnly {
+		policy, err := aof.ParseFsyncPolicy(*appendFsync)
+		if err != nil {
 			return err
 		}
-		registryOpts = append(registryOpts, command.WithPersistence(saver))
+		path := filepath.Join(*dir, *appendFilename)
+		if err := replayLog(db, path, logger); err != nil {
+			return err
+		}
+		appendLog, err := aof.Open(path, policy)
+		if err != nil {
+			return err
+		}
+		// Closing flushes and fsyncs whatever is still buffered, on every
+		// way out of this function.
+		defer func() {
+			if err := appendLog.Close(); err != nil {
+				logger.Error("could not close the append-only file", "err", err)
+			}
+		}()
+		logger.Info("append-only file is on", "path", path, "appendfsync", policy)
+		registryOpts = append(registryOpts, command.WithAppendOnly(appendLog))
 	}
 
 	ln, err := net.Listen("tcp", *addr)
@@ -97,27 +136,42 @@ func run() error {
 	return nil
 }
 
-// openSnapshot prepares the snapshot file and loads whatever it already
-// holds. A missing file is how a first start looks, so it is not an
-// error; a corrupt one is, because starting with silently incomplete data
-// is worse than refusing to start.
-func openSnapshot(db *store.Store, dir, name string, logger *slog.Logger) (*snapshot.Saver, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-	path := filepath.Join(dir, name)
-
+// loadSnapshot fills db from the snapshot at path. A missing file is how
+// a first start looks, so it is not an error; a corrupt one is, because
+// starting with silently incomplete data is worse than refusing to start.
+func loadSnapshot(db *store.Store, path string, logger *slog.Logger) error {
 	records, err := snapshot.ReadFile(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		logger.Info("no snapshot to load, starting with an empty keyspace", "path", path)
 	case err != nil:
-		return nil, fmt.Errorf("loading %s: %w", path, err)
+		return fmt.Errorf("loading %s: %w", path, err)
 	default:
 		if err := db.Restore(records); err != nil {
-			return nil, fmt.Errorf("loading %s: %w", path, err)
+			return fmt.Errorf("loading %s: %w", path, err)
 		}
 		logger.Info("snapshot loaded", "path", path, "keys", db.Len())
 	}
-	return snapshot.NewSaver(db, path, logger), nil
+	return nil
+}
+
+// replayLog rebuilds db by running the append-only file through a command
+// table of its own. That table has no log attached, which is the point:
+// replaying through the live one would append every command right back to
+// the file it came from.
+func replayLog(db *store.Store, path string, logger *slog.Logger) error {
+	replay := command.NewRegistry(db)
+	start := time.Now()
+
+	n, err := aof.Load(path, replay.Replay, logger)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		logger.Info("no append-only file to replay, starting with an empty keyspace", "path", path)
+		return nil
+	case err != nil:
+		return fmt.Errorf("replaying %s: %w", path, err)
+	}
+	logger.Info("append-only file replayed",
+		"path", path, "commands", n, "keys", db.Len(), "took", time.Since(start))
+	return nil
 }

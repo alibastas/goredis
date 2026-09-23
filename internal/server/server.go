@@ -91,6 +91,15 @@ func (s *Server) handleConn(conn net.Conn) {
 		// A client that pipelines 100 commands in one packet therefore gets
 		// all 100 replies in a single write instead of 100 small ones.
 		if r.Buffered() == 0 {
+			// The same moment is where the append-only file is pushed out,
+			// before the replies leave: a client must never be told "OK"
+			// for a write the log has not been handed to the operating
+			// system, and under the always policy not before it is on the
+			// disk. Batching this way also means one pipeline of commands
+			// costs one write to the log rather than one per command.
+			if err := s.registry.Flush(); err != nil {
+				log.Error("could not write to the append-only file", "err", err)
+			}
 			if err := w.Flush(); err != nil {
 				log.Debug("write failed", "err", err)
 				return
