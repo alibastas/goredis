@@ -71,6 +71,32 @@ leaves it to the operating system. See
 [the design notes](#the-append-only-file-a-log-of-every-write) for what
 each one actually guarantees.
 
+Besides answering questions, the server can push messages to clients that
+asked for them. One client subscribes to a channel and waits:
+
+```
+$ go run ./cmd/goredis-cli SUBSCRIBE news
+Reading messages... (press Ctrl+C to quit)
+1) "subscribe"
+2) "news"
+3) (integer) 1
+1) "message"                      # arrives on its own, nothing was asked
+2) "news"
+3) "hello everyone"
+```
+
+Another publishes to it, and is told how many subscribers it reached:
+
+```
+127.0.0.1:6380> PUBLISH news "hello everyone"
+(integer) 1
+```
+
+Nothing is stored: a message published to a channel with no subscribers
+reaches nobody and is gone. See
+[the design notes](#pubsub-is-a-doorbell-not-a-mailbox) for what that does
+and does not promise.
+
 Server flags: `-addr` sets the listen address, `-debug` enables
 per-connection logs, `-shards` sets the number of keyspace shards,
 `-dir` says where the data files live, `-dbfilename` and
@@ -89,12 +115,13 @@ go run ./cmd/goredis-benchmark -c 50 -n 200000 -P 16 -t set,get,incr,lpush
 
 | Group      | Commands |
 |------------|----------|
-| Connection | `PING`, `ECHO` |
+| Connection | `PING`, `ECHO`, `QUIT` |
 | Strings    | `GET`, `SET [NX\|XX] [EX s\|PX ms\|EXAT ts\|PXAT ms\|KEEPTTL]`, `INCR`, `DECR`, `INCRBY`, `DECRBY` |
 | Keyspace   | `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `KEYS`, `TYPE`, `DBSIZE`, `FLUSHDB` |
 | Hashes     | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN` |
 | Lists      | `LPUSH`, `RPUSH`, `LPOP [count]`, `RPOP [count]`, `LRANGE`, `LINDEX`, `LLEN` |
 | Sets       | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` |
+| Pub/Sub    | `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH` |
 | Persistence| `SAVE`, `BGSAVE`, `LASTSAVE`, `BGREWRITEAOF` |
 
 Replies and error messages match Redis, so existing clients behave the
@@ -119,7 +146,8 @@ go test ./internal/persistence/snapshot -run='^$' -fuzz=FuzzDecode   # fuzz the 
 - [x] **Phase 3a:** Snapshots: `SAVE`, `BGSAVE`, crash-safe file replacement
 - [x] **Phase 3b:** Append-only file with selectable fsync policies
 - [x] **Phase 3c:** AOF rewrite, manual and automatic
-- [ ] **Phase 4:** Pub/Sub
+- [x] **Phase 4a:** Pub/Sub: `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`
+- [ ] **Phase 4b:** Pattern subscriptions and `PUBSUB` introspection
 - [ ] **Phase 5:** Leader/follower replication
 - [ ] **Phase 6:** Leader election and automatic failover with Raft
 
@@ -130,7 +158,7 @@ cmd/goredis/          server entry point: flags, config, startup
 cmd/goredis-cli/      interactive command-line client
 cmd/goredis-benchmark/ load generator reporting throughput and latency
 internal/resp/        RESP2 parser and writer (pure protocol, no I/O policy)
-internal/server/      TCP listener, one goroutine per connection, client state
+internal/server/      TCP listener, reader and writer goroutines per connection
 internal/command/     command table and argument validation
 internal/store/       storage engine: keyspace, data types, expiry
 internal/deque/       generic ring-buffer deque backing lists
@@ -138,7 +166,7 @@ internal/glob/        Redis-style glob matching for KEYS
 internal/persistence/ crash-safe file replacement shared by the two below
 internal/persistence/snapshot/ point-in-time dump of the whole keyspace
 internal/persistence/aof/  append-only command log
-internal/pubsub/      channel and pattern subscriptions
+internal/pubsub/      channel subscriptions and message delivery
 internal/replication/ leader/follower sync
 internal/raft/        leader election
 test/integration/     end-to-end tests over real TCP connections
@@ -158,6 +186,8 @@ with each phase.
 Redis runs commands on a single-threaded event loop. goroutines are cheap and
 the Go runtime multiplexes them onto OS threads, so the idiomatic Go approach
 is one goroutine per client connection with a keyspace protected by locks.
+Since pub/sub arrived there are two per connection, one for each direction;
+[one goroutine owns the socket](#one-goroutine-owns-the-socket) explains why.
 
 ### A sharded keyspace, justified by measurement
 
@@ -298,14 +328,39 @@ takes exponential time on patterns like `*a*a*a*a*b`, so this one
 remembers the last `*` and retries from there, which keeps it at
 O(pattern × input). A test checks this with a pathological pattern.
 
-### Replies are flushed only when the input buffer is empty
+### One goroutine owns the socket
 
-Each connection has a buffered reader and a buffered writer. After a
-command runs, its reply goes into the write buffer. The buffer is flushed
-only when there are no more unread bytes from the client, right before the
-server would block waiting for more input. A client that pipelines many
-commands in one packet gets all the replies back in a single write, without
-any pipelining-specific code.
+A connection is served by two goroutines: one reads commands and runs them,
+one writes. Everything the server sends a client — replies and published
+messages alike — is queued for the writer, which is the only thing that
+touches the socket.
+
+The reason is that pub/sub breaks the assumption a request/reply server can
+otherwise make. A published message is written by whichever *other* client
+ran `PUBLISH`, so without this split a connection's buffered writer would be
+used by two goroutines at once, and their bytes would interleave into a
+stream no client can parse. Handing the socket to a single owner rules that
+out by construction rather than by locking, which also keeps the lock off
+the path of every ordinary reply.
+
+Replies are still batched. The writer flushes when its queue is momentarily
+empty, which is the moment the client would otherwise be left waiting; a
+client that pipelines a hundred commands in one packet still gets a single
+write back. That is the same idea as the previous rule — flush when there is
+nothing left to produce — moved from the reader's input buffer to the
+writer's queue.
+
+It costs nothing measurable. Interleaved runs of the same benchmark against
+the version before this change and after it, three rounds each, differ by
+less than the rounds differ from each other (medians, 50 clients, 100k
+requests):
+
+| | before | after |
+|---|---|---|
+| `SET`, no pipelining | 222k req/s | 227k req/s |
+| `GET`, no pipelining | 236k req/s | 222k req/s |
+| `SET`, pipeline 16 | 1.14M req/s | 1.14M req/s |
+| `GET`, pipeline 16 | 1.52M req/s | 1.49M req/s |
 
 ### Untrusted lengths are never used to preallocate
 
@@ -329,6 +384,74 @@ inexcusable, so `no` and `everysec` sync there too.
 
 RESP2 is what `redis-cli` and every client library support by default. RESP3
 adds richer types but no new ideas relevant to this project.
+
+### Pub/Sub is a doorbell, not a mailbox
+
+Without pub/sub, a client that wants to know when something happens has to
+keep asking. Ten thousand clients polling once a second is ten thousand
+requests a second that almost always answer "nothing yet", and halving the
+delay doubles the load. Subscribing inverts it: the client says once what it
+cares about and the server writes to it when there is something to say.
+
+What it deliberately does not do is remember. A message is handed to whoever
+is subscribed at that moment and then forgotten — it is not stored, not
+queued for a subscriber that is offline, not acknowledged and never retried.
+`PUBLISH` returns the number of subscribers it reached, and zero is a normal
+answer. Delivery is therefore at most once.
+
+That makes it the wrong tool for work that must not be lost, which is what
+Kafka and RabbitMQ are for: they write messages down, keep them for
+consumers that are not connected, and expect an acknowledgement. It makes it
+the right tool for things that are only interesting while they are happening
+— live notifications, "user is typing", telling every server in a pool to
+drop a cache entry it just invalidated. A doorbell does not save the sound
+for when you get home, and that is not a defect in the doorbell.
+
+### Replies wait, messages are dropped
+
+The queue in front of a client is bounded, so at some point a client that is
+not reading has to be dealt with. What should happen depends on who produced
+the value, and the two cases pull in opposite directions.
+
+A reply was caused by the client's own command, so the right answer is to
+make it wait: queueing a reply blocks while the queue is full, the goroutine
+running that client's commands stops, and it stops reading more of them.
+That is ordinary backpressure, and it arrives at the client as TCP flow
+control — a client that pipelines faster than it reads slows itself down and
+nobody else.
+
+A published message was caused by a different client, and that changes
+everything. If delivering to a slow subscriber could block, one subscriber
+that stopped reading would hold up the `PUBLISH` that is still trying to
+reach the others — and in this design it would hold up the broker's lock with
+it, which would stall subscribing and publishing for the whole server. So
+delivery never blocks: if a subscriber's queue is full, that subscriber is
+disconnected. Redis makes the same distinction, by size rather than by count
+(`client-output-buffer-limit` defaults to unlimited for normal clients and
+32 MB for subscribers).
+
+Losing a subscriber that cannot keep up is the intended outcome, not a
+failure to handle: the alternative is buffering for it until the server runs
+out of memory, which costs every other client too.
+
+### Subscribe mode: a smaller command set
+
+Once a client is subscribed, RESP2 gives it no way to tell a reply apart
+from a pushed message — both are just arrays arriving on the same stream.
+A client that sent `GET` and then received an array could not know whether
+it was the value or a message that happened to arrive first.
+
+Redis answers this by shrinking what a subscribed connection may do to the
+commands that keep the stream readable: `SUBSCRIBE`, `UNSUBSCRIBE`, `PING`
+and `QUIT`. Everything else is refused while any subscription is open, and
+goredis refuses it with the same message. `PING` is answered with an array
+there instead of a simple string, for the same reason: in subscribe mode
+everything on the wire has one shape.
+
+Checking this on every command has to be cheap, so the count of open
+subscriptions is kept on the connection rather than looked up in the broker,
+which would mean taking a lock before every `GET`. Only the connection's own
+goroutine changes it, and it is only ever assigned what the broker returned.
 
 ### The append-only file: a log of every write
 
