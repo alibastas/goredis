@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/alibastas/goredis/internal/pubsub"
 	"github.com/alibastas/goredis/internal/resp"
 	"github.com/alibastas/goredis/internal/store"
 )
@@ -18,8 +19,20 @@ import (
 // name, so for "ECHO hello" it is []string{"hello"}.
 type Handler func(args []string) resp.Value
 
+// SessionHandler runs a command that is about one client rather than about
+// the keyspace, and sends its own replies through the session. SUBSCRIBE
+// needs both: it changes what that particular connection receives, and it
+// answers once per channel instead of once per command.
+type SessionHandler func(s *Session, args []string)
+
 type command struct {
 	handler Handler
+	// session is set instead of handler for the commands that need the
+	// client they were sent by. Exactly one of the two is non-nil.
+	session SessionHandler
+	// allowedWhenSubscribed marks the few commands a client may still run
+	// while it is in subscribe mode. See Dispatch.
+	allowedWhenSubscribed bool
 	// arity follows the Redis convention: it counts the command name too,
 	// a positive value means exactly that many and a negative value means
 	// at least -arity. PING has arity -1, ECHO has arity 2.
@@ -34,6 +47,12 @@ type command struct {
 	// it is given: a log full of "expire in 60 seconds" would hand every
 	// key another minute of life on every replay.
 	rewrite func(args []string, now time.Time) []string
+}
+
+// whileSubscribed marks a command as one a subscribed client may run.
+func (c *command) whileSubscribed() *command {
+	c.allowedWhenSubscribed = true
+	return c
 }
 
 // write marks a command as one that changes the keyspace.
@@ -62,6 +81,9 @@ func (c command) acceptsArgCount(n int) bool {
 type Registry struct {
 	commands map[string]*command
 	db       *store.Store
+	// hub routes published messages to the clients that subscribed. Unlike
+	// the store it needs no configuring, so every registry has one.
+	hub *pubsub.Broker
 	// log is nil unless the server runs with an append-only file.
 	log AppendOnly
 	// writeLock puts write commands in a single order when there is a log.
@@ -113,12 +135,23 @@ func NewRegistry(db *store.Store, opts ...Option) *Registry {
 		opt(&cfg)
 	}
 
-	r := &Registry{commands: make(map[string]*command), db: db, log: cfg.log}
+	r := &Registry{
+		commands: make(map[string]*command),
+		db:       db,
+		hub:      pubsub.New(),
+		log:      cfg.log,
+	}
 	h := &handlers{db: db, persister: cfg.persister, log: cfg.log}
 
 	// Connection
-	r.register("PING", -1, ping)
+	r.registerSession("PING", -1, ping).whileSubscribed()
 	r.register("ECHO", 2, echo)
+	r.registerSession("QUIT", 1, quit).whileSubscribed()
+
+	// Pub/Sub
+	r.registerSession("SUBSCRIBE", -2, subscribe).whileSubscribed()
+	r.registerSession("UNSUBSCRIBE", -1, unsubscribe).whileSubscribed()
+	r.registerSession("PUBLISH", 3, publish)
 
 	// Strings
 	r.register("GET", 2, h.get)
@@ -192,30 +225,79 @@ func (r *Registry) register(name string, arity int, h Handler) *command {
 	return c
 }
 
-// Dispatch runs the command described by req and returns its reply.
-// Problems with the request itself (unknown command, wrong number of
-// arguments) are reported as RESP errors rather than Go errors, since they
-// are normal replies from the client's point of view.
-func (r *Registry) Dispatch(req resp.Value) resp.Value {
-	args, err := requestArgs(req)
-	if err != nil {
-		return resp.NewError("ERR " + err.Error())
-	}
-	return r.DispatchArgs(args)
+func (r *Registry) registerSession(name string, arity int, h SessionHandler) *command {
+	c := &command{session: h, arity: arity}
+	r.commands[name] = c
+	return c
 }
 
-// DispatchArgs is Dispatch for a command that is already split into its
-// arguments, which is the shape the append-only file replays them in.
+// Dispatch runs the command described by req on behalf of one client and
+// sends the replies to it. Most commands produce exactly one; SUBSCRIBE
+// produces one per channel.
+//
+// Problems with the request itself (unknown command, wrong number of
+// arguments) are sent as RESP errors rather than returned as Go errors,
+// since they are normal replies from the client's point of view.
+func (r *Registry) Dispatch(sess *Session, req resp.Value) {
+	args, err := requestArgs(req)
+	if err != nil {
+		sess.Send(resp.NewError("ERR " + err.Error()))
+		return
+	}
+
+	cmd, errReply := r.lookup(args)
+	if cmd == nil {
+		sess.Send(errReply)
+		return
+	}
+
+	// A subscribed client is in the middle of a stream of pushed messages,
+	// and in RESP2 there is no way to tell a reply apart from a message.
+	// Redis solves that by only accepting the handful of commands that keep
+	// the stream readable, and so do we.
+	if sess.subscribed() && !cmd.allowedWhenSubscribed {
+		sess.Send(notAllowedWhenSubscribed(args[0]))
+		return
+	}
+
+	if cmd.session != nil {
+		cmd.session(sess, args[1:])
+		return
+	}
+	sess.Send(r.run(cmd, args))
+}
+
+// DispatchArgs runs a command that is already split into its arguments and
+// returns its single reply. That is the shape the append-only file replays
+// commands in, and there is no client behind it, so the commands that
+// belong to a connection are not available.
 func (r *Registry) DispatchArgs(args []string) resp.Value {
+	cmd, errReply := r.lookup(args)
+	if cmd == nil {
+		return errReply
+	}
+	if cmd.session != nil {
+		return resp.NewError(fmt.Sprintf("ERR '%s' needs a client connection", strings.ToLower(args[0])))
+	}
+	return r.run(cmd, args)
+}
+
+// lookup finds the command args asks for. It returns nil and the reply to
+// send instead when there is no such command or the argument count is
+// wrong.
+func (r *Registry) lookup(args []string) (*command, resp.Value) {
 	name := strings.ToUpper(args[0])
 	cmd, ok := r.commands[name]
 	if !ok {
-		return unknownCommand(args)
+		return nil, unknownCommand(args)
 	}
 	if !cmd.acceptsArgCount(len(args)) {
-		return wrongArgCount(name)
+		return nil, wrongArgCount(name)
 	}
+	return cmd, resp.Value{}
+}
 
+func (r *Registry) run(cmd *command, args []string) resp.Value {
 	if cmd.changesData && r.log != nil {
 		return r.runWrite(cmd, args)
 	}
@@ -381,4 +463,10 @@ func truncate(s string) string {
 		return s[:maxArgInError]
 	}
 	return s
+}
+
+func notAllowedWhenSubscribed(name string) resp.Value {
+	return resp.NewError(fmt.Sprintf(
+		"ERR Can't execute '%s': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context",
+		strings.ToLower(name)))
 }

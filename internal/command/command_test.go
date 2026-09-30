@@ -39,7 +39,7 @@ func (h *harness) advance(d time.Duration) { h.now = h.now.Add(d) }
 // not want.
 func (h *harness) expect(want resp.Value, args ...string) {
 	h.t.Helper()
-	if got := h.r.Dispatch(cmd(args...)); !reflect.DeepEqual(got, want) {
+	if got := h.reply(args...); !reflect.DeepEqual(got, want) {
 		h.t.Fatalf("%s\n got: %+v\nwant: %+v", strings.Join(args, " "), got, want)
 	}
 }
@@ -107,9 +107,37 @@ func TestDispatch(t *testing.T) {
 	r := NewRegistry(store.New())
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := r.Dispatch(tt.req); !reflect.DeepEqual(got, tt.want) {
+			if got := dispatch(t, r, tt.req); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Dispatch(%+v)\n got: %+v\nwant: %+v", tt.req, got, tt.want)
 			}
 		})
 	}
+}
+
+// sink collects what the server would send to one client, so tests can
+// look at replies without a network.
+type sink struct {
+	replies []resp.Value
+	pushed  []resp.Value
+}
+
+func (s *sink) Send(v resp.Value) { s.replies = append(s.replies, v) }
+func (s *sink) Push(v resp.Value) { s.pushed = append(s.pushed, v) }
+
+// dispatch runs one request and returns the single reply it produced. The
+// commands that answer more than once have their own tests.
+func dispatch(t *testing.T, r *Registry, req resp.Value) resp.Value {
+	t.Helper()
+	var out sink
+	r.Dispatch(r.NewSession(&out), req)
+	if len(out.replies) != 1 {
+		t.Fatalf("got %d replies, want 1: %+v", len(out.replies), out.replies)
+	}
+	return out.replies[0]
+}
+
+// reply runs a command and returns its single reply.
+func (h *harness) reply(args ...string) resp.Value {
+	h.t.Helper()
+	return dispatch(h.t, h.r, cmd(args...))
 }

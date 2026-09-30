@@ -19,7 +19,7 @@ func array(items ...string) resp.Value {
 // like SMEMBERS.
 func (h *harness) expectUnordered(want []string, args ...string) {
 	h.t.Helper()
-	got := h.r.Dispatch(cmd(args...))
+	got := h.reply(args...)
 	var items []string
 	for _, v := range got.Array {
 		items = append(items, v.Str)
@@ -45,7 +45,7 @@ func TestHashCommands(t *testing.T) {
 	h.expect(resp.NewSimpleString("hash"), "TYPE", "user:1")
 
 	// HGETALL order isn't defined, so compare as pairs.
-	got := h.r.Dispatch(cmd("HGETALL", "user:1"))
+	got := h.reply("HGETALL", "user:1")
 	pairs := map[string]string{}
 	for i := 0; i+1 < len(got.Array); i += 2 {
 		pairs[got.Array[i].Str] = got.Array[i+1].Str

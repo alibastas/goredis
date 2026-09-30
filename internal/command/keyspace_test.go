@@ -66,14 +66,14 @@ func TestKeys(t *testing.T) {
 	}
 
 	// KEYS returns keys in no particular order, so sort before comparing.
-	got := h.r.Dispatch(cmd("KEYS", "user:*"))
+	got := h.reply("KEYS", "user:*")
 	slices.SortFunc(got.Array, func(a, b resp.Value) int { return strings.Compare(a.Str, b.Str) })
 	want := resp.NewArray(bulk("user:1"), bulk("user:2"))
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("KEYS user:*\n got: %+v\nwant: %+v", got, want)
 	}
 
-	if got := h.r.Dispatch(cmd("KEYS", "nope*")); got.Type != resp.Array || got.Null || len(got.Array) != 0 {
+	if got := h.reply("KEYS", "nope*"); got.Type != resp.Array || got.Null || len(got.Array) != 0 {
 		t.Fatalf("KEYS nope*: got %+v, want an empty array", got)
 	}
 }

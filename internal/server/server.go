@@ -82,33 +82,26 @@ func (s *Server) handleConn(conn net.Conn) {
 	log.Debug("client connected")
 	defer log.Debug("client disconnected")
 
+	c := newClientConn(conn, s.registry, log)
+	go c.writeLoop()
+	// Let the writer send what is left and wait for it to finish: it owns
+	// the socket, so nothing may close it while it is still writing.
+	defer func() {
+		close(c.quit)
+		<-c.dead
+	}()
+
+	// The session is this client's own state, and the handle publishers
+	// deliver messages through. Dropping it before the writer stops means
+	// no message can be queued for a client that is already gone.
+	sess := s.registry.NewSession(c)
+	defer sess.Close()
+
 	r := resp.NewReader(conn)
-	w := resp.NewWriter(conn)
-
 	for {
-		// Replies are buffered and only sent once there is nothing left to
-		// read, i.e. right before we would block waiting for the client.
-		// A client that pipelines 100 commands in one packet therefore gets
-		// all 100 replies in a single write instead of 100 small ones.
-		if r.Buffered() == 0 {
-			// The same moment is where the append-only file is pushed out,
-			// before the replies leave: a client must never be told "OK"
-			// for a write the log has not been handed to the operating
-			// system, and under the always policy not before it is on the
-			// disk. Batching this way also means one pipeline of commands
-			// costs one write to the log rather than one per command.
-			if err := s.registry.Flush(); err != nil {
-				log.Error("could not write to the append-only file", "err", err)
-			}
-			if err := w.Flush(); err != nil {
-				log.Debug("write failed", "err", err)
-				return
-			}
-		}
-
 		req, err := r.ReadValue()
 		if err != nil {
-			s.handleReadError(log, w, err)
+			s.handleReadError(log, c, err)
 			return
 		}
 
@@ -117,22 +110,19 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
-		if err := w.WriteValue(s.registry.Dispatch(req)); err != nil {
-			// Only happens if a handler returns a malformed Value, which is
-			// a bug on our side, not the client's.
-			log.Error("cannot encode reply", "err", err)
+		s.registry.Dispatch(sess, req)
+		if sess.QuitRequested() {
 			return
 		}
 	}
 }
 
-func (s *Server) handleReadError(log *slog.Logger, w *resp.Writer, err error) {
+func (s *Server) handleReadError(log *slog.Logger, c *clientConn, err error) {
 	switch {
 	case errors.Is(err, resp.ErrProtocol):
 		// Once the stream is malformed there is no way to find where the
 		// next command starts, so tell the client why and hang up.
-		w.WriteValue(resp.NewError("ERR " + err.Error()))
-		w.Flush()
+		c.Send(resp.NewError("ERR " + err.Error()))
 		log.Debug("closing connection after protocol error", "err", err)
 	case errors.Is(err, io.EOF), errors.Is(err, net.ErrClosed):
 		// The client hung up, or we closed the connection during shutdown.
