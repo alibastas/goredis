@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -101,7 +102,10 @@ func TestFormatReply(t *testing.T) {
 
 // startServer runs a goredis server on a free port and returns a client
 // connected to it.
-func startServer(t *testing.T) *client {
+// startServer runs a server for the test and returns a connected client, the
+// address to open more connections on, and a function that shuts the server
+// down early.
+func startServer(t *testing.T) (c *client, addr string, shutdown func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -114,9 +118,16 @@ func startServer(t *testing.T) *client {
 		srv.Serve(ctx, ln)
 		close(done)
 	}()
-	t.Cleanup(func() { cancel(); <-done })
+	shutdown = func() { cancel(); <-done }
+	t.Cleanup(shutdown)
 
-	conn, err := net.Dial("tcp", ln.Addr().String())
+	return connect(t, ln.Addr().String()), ln.Addr().String(), shutdown
+}
+
+// connect opens one more client connection to the test server.
+func connect(t *testing.T, addr string) *client {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +137,7 @@ func startServer(t *testing.T) *client {
 
 // TestREPL drives a whole interactive session against a real server.
 func TestREPL(t *testing.T) {
-	c := startServer(t)
+	c, _, _ := startServer(t)
 
 	input := strings.Join([]string{
 		`SET greeting "merhaba dünya"`,
@@ -158,7 +169,7 @@ func TestREPL(t *testing.T) {
 }
 
 func TestREPLStripsByteOrderMark(t *testing.T) {
-	c := startServer(t)
+	c, _, _ := startServer(t)
 
 	var out strings.Builder
 	if err := repl(c, "test", strings.NewReader(byteOrderMark+"PING\n"), &out); err != nil {
@@ -166,5 +177,59 @@ func TestREPLStripsByteOrderMark(t *testing.T) {
 	}
 	if want := "test> PONG\ntest> \n"; out.String() != want {
 		t.Errorf("got %q, want %q", out.String(), want)
+	}
+}
+
+// TestSubscribeMode checks the other half of the client: after SUBSCRIBE it
+// stops waiting for the user and prints whatever the server sends.
+func TestSubscribeMode(t *testing.T) {
+	c, addr, shutdown := startServer(t)
+
+	// A pipe makes this deterministic: every line the client prints is read
+	// here, so the test never has to wait and guess.
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		err := listen(c, pw, []string{"SUBSCRIBE", "news"})
+		pw.Close()
+		done <- err
+	}()
+
+	lines := bufio.NewScanner(pr)
+	next := func() string {
+		t.Helper()
+		if !lines.Scan() {
+			t.Fatalf("the client stopped printing: %v", lines.Err())
+		}
+		return lines.Text()
+	}
+
+	if got, want := next(), "Reading messages... (press Ctrl+C to quit)"; got != want {
+		t.Errorf("first line = %q, want %q", got, want)
+	}
+	for _, want := range []string{`1) "subscribe"`, `2) "news"`, `3) (integer) 1`} {
+		if got := next(); got != want {
+			t.Errorf("subscribe confirmation line = %q, want %q", got, want)
+		}
+	}
+
+	publisher := connect(t, addr)
+	if reply, err := publisher.do([]string{"PUBLISH", "news", "hello"}); err != nil {
+		t.Fatalf("publish: %v", err)
+	} else if reply.Int != 1 {
+		t.Fatalf("PUBLISH reached %d subscribers, want 1", reply.Int)
+	}
+
+	for _, want := range []string{`1) "message"`, `2) "news"`, `3) "hello"`} {
+		if got := next(); got != want {
+			t.Errorf("message line = %q, want %q", got, want)
+		}
+	}
+
+	// A subscription ends when the server closes the connection, which is
+	// not an error for the client.
+	shutdown()
+	if err := <-done; err != nil {
+		t.Errorf("listen returned %v, want nil after the connection closed", err)
 	}
 }

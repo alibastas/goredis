@@ -7,6 +7,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -40,6 +41,9 @@ func run() error {
 
 	// With arguments: run a single command, like `redis-cli GET name`.
 	if flag.NArg() > 0 {
+		if entersSubscribeMode(flag.Args()) {
+			return listen(c, os.Stdout, flag.Args())
+		}
 		reply, err := c.do(flag.Args())
 		if err != nil {
 			return err
@@ -59,20 +63,31 @@ func newClient(conn net.Conn) *client {
 	return &client{r: resp.NewReader(conn), w: resp.NewWriter(conn)}
 }
 
-// do sends one command and waits for its reply. Commands go out in the
-// same shape every Redis client uses: an array of bulk strings.
+// do sends one command and waits for its reply.
 func (c *client) do(args []string) (resp.Value, error) {
+	if err := c.send(args); err != nil {
+		return resp.Value{}, err
+	}
+	return c.read()
+}
+
+// send writes one command. Commands go out in the same shape every Redis
+// client uses: an array of bulk strings.
+func (c *client) send(args []string) error {
 	elems := make([]resp.Value, len(args))
 	for i, a := range args {
 		elems[i] = resp.NewBulkString(a)
 	}
 	if err := c.w.WriteValue(resp.NewArray(elems...)); err != nil {
-		return resp.Value{}, err
+		return err
 	}
 	if err := c.w.Flush(); err != nil {
-		return resp.Value{}, fmt.Errorf("sending command: %w", err)
+		return fmt.Errorf("sending command: %w", err)
 	}
+	return nil
+}
 
+func (c *client) read() (resp.Value, error) {
 	reply, err := c.r.ReadValue()
 	if err != nil {
 		return resp.Value{}, fmt.Errorf("reading reply: %w", err)
@@ -117,10 +132,44 @@ func repl(c *client, addr string, in io.Reader, out io.Writer) error {
 		if cmd := strings.ToLower(args[0]); cmd == "quit" || cmd == "exit" {
 			return nil
 		}
+		if entersSubscribeMode(args) {
+			return listen(c, out, args)
+		}
 
 		reply, err := c.do(args)
 		if err != nil {
 			return fmt.Errorf("connection to %s lost: %w", addr, err)
+		}
+		fmt.Fprintln(out, formatReply(reply))
+	}
+}
+
+// entersSubscribeMode reports whether a command puts the connection into
+// subscribe mode. From then on the server sends messages of its own accord,
+// so the client has to keep reading instead of waiting for the next thing
+// the user types.
+func entersSubscribeMode(args []string) bool {
+	return strings.EqualFold(args[0], "SUBSCRIBE")
+}
+
+// listen sends a subscribe command and prints everything that arrives, for
+// as long as the connection lasts. redis-cli behaves the same way: there is
+// no way back to the prompt, the user ends the session with Ctrl+C.
+func listen(c *client, out io.Writer, args []string) error {
+	if err := c.send(args); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "Reading messages... (press Ctrl+C to quit)")
+
+	for {
+		reply, err := c.read()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// The server hung up, which is a normal way for a
+				// subscription to end.
+				return nil
+			}
+			return err
 		}
 		fmt.Fprintln(out, formatReply(reply))
 	}
